@@ -22,9 +22,11 @@ import yt_dlp.networking.impersonate
 from yt_dlp.postprocessor.common import PostProcessor
 from yt_dlp.utils import STR_FORMAT_RE_TMPL, STR_FORMAT_TYPES
 import bg_tasks
+from cctv import OUTTMPL_PRE_RESOLVE_PREFIXES, RESOLVE_TIMEOUT, is_cctv_episode_url, resolve_episode
 from dl_formats import get_format, get_opts, AUDIO_FORMATS, merge_ytdl_option_layers
 from music_metadata import MusicMetadataPreProcessor
 from datetime import datetime
+from site_expanders import expand_url, is_cctv_url
 from state_store import AtomicJsonStore, from_json_compatible, read_legacy_shelf, to_json_compatible
 from subscriptions import _entry_id
 from url_guard import validate_url, install_socket_guard
@@ -484,6 +486,7 @@ class DownloadInfo:
         live_status=None,
         live_release_timestamp=None,
         sponsorblock=False,
+        forced_format=None,
     ):
         self.id = id if len(custom_name_prefix) == 0 else f'{custom_name_prefix}.{id}'
         self.title = title if len(custom_name_prefix) == 0 else f'{custom_name_prefix}.{title}'
@@ -492,6 +495,9 @@ class DownloadInfo:
         self.download_type = download_type
         self.codec = codec
         self.format = format
+        # yt-dlp format selector forced by the CCTV quality resolver for
+        # single-media-playlist streams (None = pick normally from format).
+        self.forced_format = forced_format
         self.folder = folder
         self.custom_name_prefix = custom_name_prefix
         self.msg = self.percent = self.speed = self.eta = None
@@ -601,6 +607,8 @@ class DownloadInfo:
             self.clip_start = None
         if not hasattr(self, "clip_end"):
             self.clip_end = None
+        if not hasattr(self, "forced_format"):
+            self.forced_format = None
         if not hasattr(self, "live_status"):
             self.live_status = None
         if not hasattr(self, "live_release_timestamp"):
@@ -615,6 +623,7 @@ _PERSISTED_DOWNLOAD_FIELDS = (
     "download_type",
     "codec",
     "format",
+    "forced_format",
     "folder",
     "custom_name_prefix",
     "playlist_item_limit",
@@ -717,7 +726,11 @@ class Download:
         self.output_template_chapter = output_template_chapter
         self.allow_private = allow_private
         self.info = info
-        self.format = get_format(
+        # A resolved CCTV ladder stream is a single media playlist with no
+        # height metadata; tier/codec filters would match nothing. The
+        # resolver sets a forced selector to bypass that. get_opts below
+        # still applies the user's chosen container/codec via merge_output_format.
+        self.format = getattr(info, 'forced_format', None) or get_format(
             getattr(info, 'download_type', 'video'),
             getattr(info, 'codec', 'auto'),
             format,
@@ -1640,6 +1653,39 @@ class DownloadQueue:
         if playlist_item_limit > 0:
             log.info(f'playlist limit is set. Processing only first {playlist_item_limit} entries')
             ytdl_options['playlistend'] = playlist_item_limit
+        # CCTV per-episode quality resolution: rewrite the VIDE page URL to
+        # the best clear-CDN playlist (see app/cctv.py). Any failure leaves
+        # the download exactly as it would have been without this block.
+        if (getattr(dl, 'download_type', '') == 'video'
+                and is_cctv_episode_url(dl.url)):
+            try:
+                resolved = await asyncio.wait_for(
+                    resolve_episode(
+                        dl.url,
+                        dl.quality,
+                        entry=entry,
+                        allow_private=self.config.ALLOW_PRIVATE_ADDRESSES,
+                    ),
+                    timeout=RESOLVE_TIMEOUT,
+                )
+            except Exception:
+                log.warning('CCTV resolve failed for %s; using default path',
+                            dl.url, exc_info=True)
+                resolved = None
+            if resolved is not None:
+                log.info('CCTV: %s -> %s (source=%s tier=%s forced=%s)',
+                         dl.url, resolved.url, resolved.source,
+                         resolved.probed_quality, resolved.forced_format)
+                dl.url = resolved.url
+                dl.forced_format = resolved.forced_format
+                # The rewritten URL points at a bare m3u8 whose generic
+                # extraction would produce a basename like "2000". Pre-resolve
+                # %(title)s/%(id)s/%(uploader)s/%(upload_date)s here so the
+                # output filename keeps the real episode title; %(ext)s and
+                # other dynamic fields stay for yt-dlp to evaluate.
+                if entry:
+                    sanitized = {k: _sanitize_path_component(v) for k, v in entry.items()}
+                    output = _resolve_outtmpl_fields(output, sanitized, OUTTMPL_PRE_RESOLVE_PREFIXES)
         download = Download(dldirectory, self.config.TEMP_DIR, output, output_chapter, dl.quality, dl.format, ytdl_options, dl, allow_private=self.config.ALLOW_PRIVATE_ADDRESSES)
         is_upcoming = (
             getattr(dl, 'live_status', None) == 'is_upcoming'
@@ -2018,6 +2064,36 @@ class DownloadQueue:
                 clip_start, clip_end, retry_entry,
             )
             return {'status': 'error', 'msg': url_error}
+        # Site-specific series-page expansion: a CCTV 合集/栏目 URL stands
+        # for many VIDE episode pages, and each episode must enter the queue
+        # on its own so the per-episode quality resolver can run on it.
+        # expand_url returns [] on any failure; in that case fall through to
+        # the generic yt-dlp path below.
+        if download_type == 'video' and is_cctv_url(url) and not is_cctv_episode_url(url):
+            try:
+                episodes = await asyncio.wait_for(expand_url(url), timeout=15)
+            except Exception:
+                log.warning('CCTV series expansion failed for %s', url, exc_info=True)
+                episodes = []
+            if episodes:
+                if playlist_item_limit > 0:
+                    episodes = episodes[:playlist_item_limit]
+                log.info('CCTV series page %s expanded into %d episode(s)',
+                         url, len(episodes))
+                results = []
+                for ep in episodes:
+                    results.append(await self.add(
+                        ep, download_type, codec, format, quality, folder,
+                        custom_name_prefix, playlist_item_limit, auto_start,
+                        split_by_chapters, chapter_template, subtitle_language,
+                        subtitle_mode, ytdl_options_presets, ytdl_options_overrides,
+                        clip_start, clip_end,
+                        already=already, _add_gen=_add_gen, sponsorblock=sponsorblock))
+                errors = [r.get('msg') for r in results if r.get('status') == 'error']
+                if errors:
+                    return {'status': 'error',
+                            'msg': f'{len(errors)} of {len(episodes)} episodes failed: {errors[0]}'}
+                return {'status': 'ok'}
         try:
             entry = await asyncio.get_running_loop().run_in_executor(
                 None,

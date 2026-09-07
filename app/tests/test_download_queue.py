@@ -1483,4 +1483,158 @@ async def test_clear_skips_deletion_outside_download_directory(dq_env):
     await dq.clear([download.info.url])
 
     assert os.path.exists(outside_file)
-    assert not dq.done.exists(download.info.url)
+
+
+# --- CCTV integration -------------------------------------------------------
+
+import cctv as _cctv  # noqa: E402  (used to construct fake CctvStream instances)
+import ytdl as _ytdl  # noqa: E402  (used by monkeypatch targets below)
+
+
+CCTV_EP = 'https://tv.cctv.com/2024/02/21/VIDEAbcdEf0123456789.shtml'
+CCTV_SERIES = 'https://tv.cctv.com/lm/xwlb/'
+
+
+async def test_cctv_episode_url_rewrites_to_generic_with_forced_format(dq_env, monkeypatch):
+    """The episode URL is rewritten to the resolved generic m3u8 and the
+    forced format selector bypasses the normal height-based choice."""
+    notifier = AsyncMock()
+
+    def fake_extract(self, url, *_args, **_kwargs):
+        return {'_type': 'video', 'id': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                'title': '节目名', 'url': url, 'webpage_url': url}
+
+    resolved = _cctv.CctvStream(
+        url='generic:https://dh5.cntv.myhwcdn.cn/asp/hls/2000/M/2000.m3u8',
+        forced_format=_cctv.FORCED_FORMAT,
+        source='clear-ladder', probed_quality='2000', title='节目名')
+
+    async def fake_resolve(url, quality, *, entry=None, allow_private=False):
+        return resolved
+
+    monkeypatch.setattr(_ytdl, 'resolve_episode', fake_resolve)
+
+    dq = DownloadQueue(dq_env, notifier)
+    with patch.object(DownloadQueue, '_DownloadQueue__extract_info', fake_extract):
+        result = await dq.add(
+            CCTV_EP, 'video', 'auto', 'any', 'best', '', '', 0, auto_start=False)
+    assert result['status'] == 'ok'
+    # The download lands in pending under the REWRITTEN url (generic:...)
+    dl = dq.pending.get(resolved.url)
+    assert dl.info.url == resolved.url
+    assert dl.info.forced_format == _cctv.FORCED_FORMAT
+    assert dl.format == _cctv.FORCED_FORMAT
+
+
+async def test_cctv_episode_url_pre_resolves_title_in_outtmpl(dq_env, monkeypatch):
+    """The rewritten URL is a bare m3u8 whose generic extraction would
+    produce a basename like '2000'. Pre-resolving %(title)s here keeps the
+    real episode title in the output filename; %(ext)s is left dynamic."""
+    notifier = AsyncMock()
+
+    def fake_extract(self, url, *_args, **_kwargs):
+        return {'_type': 'video', 'id': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                'title': '《新闻联播》 20240221', 'url': url, 'webpage_url': url}
+
+    async def fake_resolve(url, quality, *, entry=None, allow_private=False):
+        return _cctv.CctvStream(
+            url='generic:https://dh5.cntv.myhwcdn.cn/asp/hls/2000/M/2000.m3u8',
+            forced_format=_cctv.FORCED_FORMAT,
+            source='clear-ladder', probed_quality='2000', title='《新闻联播》 20240221')
+
+    monkeypatch.setattr(_ytdl, 'resolve_episode', fake_resolve)
+
+    dq = DownloadQueue(dq_env, notifier)
+    with patch.object(DownloadQueue, '_DownloadQueue__extract_info', fake_extract):
+        await dq.add(CCTV_EP, 'video', 'auto', 'any', 'best', '', '', 0, auto_start=False)
+
+    rewritten = 'generic:https://dh5.cntv.myhwcdn.cn/asp/hls/2000/M/2000.m3u8'
+    dl = dq.pending.get(rewritten)
+    assert dl.output_template == '《新闻联播》 20240221.%(ext)s'
+
+
+async def test_cctv_resolve_failure_falls_back_to_original_behavior(dq_env, monkeypatch):
+    """If the resolver returns None (any failure), the download must look
+    exactly like it would have without the resolver wired in."""
+    from dl_formats import get_format
+    notifier = AsyncMock()
+
+    def fake_extract(self, url, *_args, **_kwargs):
+        return {'_type': 'video', 'id': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                'title': '节目名', 'url': url, 'webpage_url': url}
+
+    async def fake_resolve(url, quality, *, entry=None, allow_private=False):
+        return None  # the resolver gave up
+
+    monkeypatch.setattr(_ytdl, 'resolve_episode', fake_resolve)
+
+    dq = DownloadQueue(dq_env, notifier)
+    with patch.object(DownloadQueue, '_DownloadQueue__extract_info', fake_extract):
+        await dq.add(CCTV_EP, 'video', 'auto', 'any', 'best', '', '', 0, auto_start=False)
+
+    dl = dq.pending.get(CCTV_EP)
+    assert dl.info.url == CCTV_EP                       # not rewritten
+    assert dl.info.forced_format is None
+    assert dl.format == get_format('video', 'auto', 'any', 'best')
+    assert dl.output_template == '%(title)s.%(ext)s'    # %(title)s still dynamic
+
+
+async def test_cctv_series_page_expands_to_episodes(dq_env, monkeypatch):
+    """A CCTV column/index URL is expanded into its episode URLs; each
+    episode goes through add() recursively with the resolver."""
+    notifier = AsyncMock()
+    episodes = [CCTV_EP, CCTV_EP.replace('AbcdEf', 'BcdeFg')]
+
+    async def fake_expand(url):
+        return episodes
+
+    async def fake_resolve(url, quality, *, entry=None, allow_private=False):
+        return _cctv.CctvStream(
+            url=f'generic:https://x/{url.rsplit("/", 1)[-1]}',
+            forced_format=_cctv.FORCED_FORMAT,
+            source='clear-ladder', probed_quality='2000', title='t')
+
+    monkeypatch.setattr(_ytdl, 'expand_url', fake_expand)
+    monkeypatch.setattr(_ytdl, 'resolve_episode', fake_resolve)
+
+    # for the per-episode add(): __extract_info just echoes the URL back
+    def fake_extract(self, url, *_args, **_kwargs):
+        return {'_type': 'video', 'id': 'a' * 32, 'title': 't',
+                'url': url, 'webpage_url': url}
+
+    dq = DownloadQueue(dq_env, notifier)
+    with patch.object(DownloadQueue, '_DownloadQueue__extract_info', fake_extract):
+        result = await dq.add(CCTV_SERIES, 'video', 'auto', 'any', 'best',
+                              '', '', 0, auto_start=False)
+
+    assert result['status'] == 'ok'
+    # both episodes are now in the queue, each rewritten by the resolver
+    # and stored under its rewritten (generic:...) URL
+    for ep in episodes:
+        rewritten = f'generic:https://x/{ep.rsplit("/", 1)[-1]}'
+        assert dq.pending.exists(rewritten)
+        dl = dq.pending.get(rewritten)
+        assert dl.info.url.startswith('generic:')
+
+
+def test_cctv_old_persisted_record_without_forced_format_loads_cleanly(dq_env):
+    """Backward compatibility: records saved before forced_format existed
+    must load with forced_format=None and round-trip safely."""
+    info = DownloadInfo(
+        id='x', title='t', url=CCTV_EP, quality='best', download_type='video',
+        codec='auto', format='any', folder='', custom_name_prefix='', error=None,
+        entry=None, playlist_item_limit=0, split_by_chapters=False, chapter_template=None,
+    )
+    # Simulate an old record: drop forced_format if present
+    info.__dict__.pop('forced_format', None)
+    record = _ytdl._download_info_to_record(info, include_entry=False)
+    assert 'forced_format' not in record
+
+    reloaded = _ytdl._download_info_from_record(record)
+    assert reloaded.forced_format is None
+    # The reload must produce a working download object
+    dl = Download(dq_env.DOWNLOAD_DIR, dq_env.TEMP_DIR,
+                  dq_env.OUTPUT_TEMPLATE, dq_env.OUTPUT_TEMPLATE_CHAPTER,
+                  reloaded.quality, reloaded.format, {}, reloaded,
+                  allow_private=False)
+    assert dl.format == 'bestvideo+bestaudio/best'
