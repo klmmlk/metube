@@ -1509,7 +1509,8 @@ async def test_cctv_episode_url_rewrites_to_generic_with_forced_format(dq_env, m
         forced_format=_cctv.FORCED_FORMAT,
         source='clear-ladder', probed_quality='2000', title='节目名')
 
-    async def fake_resolve(url, quality, *, entry=None, allow_private=False):
+    async def fake_resolve(url, quality, *, entry=None, allow_private=False,
+                             h5e_base=None, _h5e_probe=None):
         return resolved
 
     monkeypatch.setattr(_ytdl, 'resolve_episode', fake_resolve)
@@ -1536,7 +1537,8 @@ async def test_cctv_episode_url_pre_resolves_title_in_outtmpl(dq_env, monkeypatc
         return {'_type': 'video', 'id': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
                 'title': '《新闻联播》 20240221', 'url': url, 'webpage_url': url}
 
-    async def fake_resolve(url, quality, *, entry=None, allow_private=False):
+    async def fake_resolve(url, quality, *, entry=None, allow_private=False,
+                             h5e_base=None, _h5e_probe=None):
         return _cctv.CctvStream(
             url='generic:https://dh5.cntv.myhwcdn.cn/asp/hls/2000/M/2000.m3u8',
             forced_format=_cctv.FORCED_FORMAT,
@@ -1563,7 +1565,8 @@ async def test_cctv_resolve_failure_falls_back_to_original_behavior(dq_env, monk
         return {'_type': 'video', 'id': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
                 'title': '节目名', 'url': url, 'webpage_url': url}
 
-    async def fake_resolve(url, quality, *, entry=None, allow_private=False):
+    async def fake_resolve(url, quality, *, entry=None, allow_private=False,
+                             h5e_base=None, _h5e_probe=None):
         return None  # the resolver gave up
 
     monkeypatch.setattr(_ytdl, 'resolve_episode', fake_resolve)
@@ -1588,7 +1591,8 @@ async def test_cctv_series_page_expands_to_episodes(dq_env, monkeypatch):
     async def fake_expand(url):
         return episodes
 
-    async def fake_resolve(url, quality, *, entry=None, allow_private=False):
+    async def fake_resolve(url, quality, *, entry=None, allow_private=False,
+                             h5e_base=None, _h5e_probe=None):
         return _cctv.CctvStream(
             url=f'generic:https://x/{url.rsplit("/", 1)[-1]}',
             forced_format=_cctv.FORCED_FORMAT,
@@ -1650,7 +1654,8 @@ def _patch_cctv_resolver(monkeypatch, fake_resolve):
     URL with forced_format. Tests that want a different per-episode result
     can pass their own."""
     if fake_resolve is None:
-        async def fake_resolve(url, quality, *, entry=None, allow_private=False):
+        async def fake_resolve(url, quality, *, entry=None, allow_private=False,
+                             h5e_base=None, _h5e_probe=None):
             return _cctv.CctvStream(
                 url=f'generic:https://x/{url.rsplit("/", 1)[-1]}',
                 forced_format=_cctv.FORCED_FORMAT,

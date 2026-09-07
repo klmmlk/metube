@@ -23,7 +23,9 @@ import yt_dlp.networking.impersonate
 from yt_dlp.postprocessor.common import PostProcessor
 from yt_dlp.utils import STR_FORMAT_RE_TMPL, STR_FORMAT_TYPES
 import bg_tasks
-from cctv import OUTTMPL_PRE_RESOLVE_PREFIXES, RESOLVE_TIMEOUT, _VIDA_LANDING_PATH_RE, is_cctv_episode_url, maybe_rewrite_vida_landing, resolve_episode
+from cctv import OUTTMPL_PRE_RESOLVE_PREFIXES, RESOLVE_TIMEOUT, is_cctv_episode_url, maybe_rewrite_vida_landing, resolve_episode
+from cctv_h5e_proxy import ROUTE as CCTV_H5E_ROUTE
+from cctv_h5e_proxy import proxy_base as cctv_h5e_proxy_base
 from dl_formats import get_format, get_opts, AUDIO_FORMATS, merge_ytdl_option_layers
 from music_metadata import MusicMetadataPreProcessor
 from datetime import datetime
@@ -124,6 +126,24 @@ def _pot_provider_urls(ytdl_opts: dict) -> tuple:
             if values:
                 urls.append(values[0])
     return tuple(urls)
+
+
+def _cctv_h5e_proxy_origins(url: str) -> tuple:
+    """Origin of the local CCTV H5E decrypting proxy when *url* points at it
+    (the CCTV resolver hands yt-dlp a loopback proxy URL, see cctv_h5e_proxy).
+    Same idea as the PO token provider: the download must keep reaching this
+    one loopback endpoint while the socket guard blocks everything else
+    private. Only http(s) URLs can ever land here (validate_url at ingress
+    rejects other schemes)."""
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return ()
+    if parts.scheme not in ('http', 'https') or not parts.netloc:
+        return ()
+    if f'/{CCTV_H5E_ROUTE}' not in (parts.path or ''):
+        return ()
+    return (f'{parts.scheme}://{parts.netloc}',)
 
 
 _MP_CTX = (
@@ -886,7 +906,8 @@ class Download:
         install_socket_guard(
             self.allow_private,
             proxy_urls=(self.ytdl_opts.get('proxy'),),
-            service_urls=_pot_provider_urls(self.ytdl_opts),
+            service_urls=_pot_provider_urls(self.ytdl_opts)
+                          + _cctv_h5e_proxy_origins(self.info.url),
         )
         log.info(f"Starting download for: {self.info.title} ({self.info.url})")
         # Bound outside the try so the except branch can read what was captured
@@ -1670,25 +1691,10 @@ class DownloadQueue:
         # CCTV per-episode quality resolution: rewrite the VIDE page URL to
         # the best clear-CDN playlist (see app/cctv.py). Any failure leaves
         # the download exactly as it would have been without this block.
+        # (VIDA landing pages were already rewritten to their first VIDE
+        # sibling inside add(), before __extract_info ran.)
         if (getattr(dl, 'download_type', '') == 'video'
                 and is_cctv_episode_url(dl.url)):
-            # VIDA-prefixed CCTV single-episode URLs are landing pages, not
-            # video pages: their inline JS contains no ``guid`` and yt-dlp's
-            # CCTVIE can't extract a video id, so the default path fails with
-            # "Unable to extract video id". The page itself points at one
-            # VIDE sibling in jsonData2[0] (the same list cctv_series scans
-            # for whole-series expansion) -- rewrite dl.url to that sibling
-            # so the rest of the resolver and yt-dlp see a real episode page.
-            try:
-                rewritten = await asyncio.wait_for(
-                    maybe_rewrite_vida_landing(dl.url,
-                        allow_private=self.config.ALLOW_PRIVATE_ADDRESSES),
-                    timeout=RESOLVE_TIMEOUT)
-            except Exception:
-                rewritten = None
-            if rewritten is not None:
-                log.info('CCTV VIDA landing %s -> %s', dl.url, rewritten)
-                dl.url = rewritten
             try:
                 resolved = await asyncio.wait_for(
                     resolve_episode(
@@ -1696,6 +1702,9 @@ class DownloadQueue:
                         dl.quality,
                         entry=entry,
                         allow_private=self.config.ALLOW_PRIVATE_ADDRESSES,
+                        h5e_base=cctv_h5e_proxy_base(
+                            self.config.HOST, self.config.PORT,
+                            self.config.URL_PREFIX),
                     ),
                     timeout=RESOLVE_TIMEOUT,
                 )
@@ -2183,6 +2192,24 @@ class DownloadQueue:
                 return {'status': 'ok'}
             # Single/unknown/None -> fall through to the standard
             # single-episode path below; never worse than not opting in.
+        # VIDA-prefixed CCTV URLs are landing pages, not video pages: no
+        # guid in the inline JS, so yt-dlp's CCTVIE fails extraction with
+        # "Unable to extract video id" and the add dies right here. The
+        # page points at its first VIDE sibling in jsonData2 -- rewrite
+        # before __extract_info so both the probe and the download see a
+        # real episode page. (maybe_rewrite_vida_landing returns None for
+        # non-VIDA URLs without fetching, so this is a no-op elsewhere.)
+        if download_type == 'video' and is_cctv_episode_url(url):
+            try:
+                rewritten = await asyncio.wait_for(
+                    maybe_rewrite_vida_landing(
+                        url, allow_private=self.config.ALLOW_PRIVATE_ADDRESSES),
+                    timeout=RESOLVE_TIMEOUT)
+            except Exception:
+                rewritten = None
+            if rewritten is not None:
+                log.info('CCTV VIDA landing %s -> %s', url, rewritten)
+                url = rewritten
         try:
             entry = await asyncio.get_running_loop().run_in_executor(
                 None,

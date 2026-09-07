@@ -37,19 +37,29 @@ module. Two subtleties keep a rewritten download working:
 Two live-CDN behaviours learned from probing tv.cctv.com in 2026-09 and
 encoded in ``_resolve_streams``:
 
-* Episode masters are routinely *incomplete* -- a 新闻联播 master listed
-  only the 450 (270p) tier while its 2000/1200/850 directories all served
-  playlists. The quality-directory ladder therefore runs BEFORE the master
-  is consulted; the master is only a last resort.
+* Episode masters are routinely *incomplete*: a 新闻联播 master listed
+  450/850/1200 while its ``/2000/`` directory kept serving a distinct
+  2.1 Mbps encode the master never mentions. The quality-directory ladder
+  therefore runs BEFORE the master is consulted.
+* Tier directories can be *aliases*: for one 儿童剧 episode the
+  ``/2000/`` and ``/1200/`` directories served the 270p encode's exact
+  bytes (identical first-segment checksum) while a genuinely distinct 850
+  encode existed and the master admitted only 270p. A ladder hit therefore
+  proves nothing by itself: above the floor tier, each hit's first segment
+  is fingerprinted via a HEAD Content-Length and compared with the 450
+  floor's -- equal means alias and the ladder keeps walking down.
 * The video-info API intermittently truncates its JSON body mid-string
   (server-side Content-Length overstatement, worse under request bursts;
   ``hls_url`` sits near the end of the payload so truncated responses are
   unusable). ``_fetch_api_info`` retries a couple of times.
 
-Encrypted streams (``manifest.hls_h5e_url`` and friends) routinely hold the
-1080p/4K tiers, but their TS segments use CCTV's proprietary H5E NAL-level
-encryption; they are recorded here for reporting only (see CctvStream) --
-downloading them needs a decryptor and is future work.
+Encrypted streams (``manifest.hls_h5e_url`` and friends) hold the tiers the
+clear CDN withholds (720p/1080p/4K), but their TS segments use CCTV's
+proprietary H5E NAL-level encryption. When the resolver runs inside the
+server (``h5e_base`` given) and an encrypted variant *strictly* beats the
+clear result, its media playlist is served through the local decrypting
+proxy (cctv_h5e_proxy) after an end-to-end self-check; any failure keeps
+the clear result.
 
 The right long-term home for this logic is yt-dlp's CCTVIE; when that lands
 upstream, this module and its single call site can be deleted.
@@ -68,6 +78,8 @@ from urllib.parse import urljoin, urlparse, urlencode
 
 import aiohttp
 
+from cctv_h5e_proxy import probe as _h5e_probe_default
+from cctv_h5e_proxy import proxy_url as _h5e_proxy_url
 from url_guard import validate_url
 
 log = logging.getLogger('cctv')
@@ -79,6 +91,12 @@ UA = 'Lavf/60.10.100'
 # numbers are nominal bitrates in kbps). 2000~1080p, 1200~720p, 850~480p,
 # 450~360p, 4000/3000 are the 4K/2K-plus tiers.
 LADDER = ('4000', '3000', '2000', '1200', '850', '450')
+
+# Nominal pixel height of each clear tier -- clear media playlists carry no
+# RESOLUTION metadata, so this table is what a ladder hit is compared against
+# when deciding whether an encrypted variant is strictly better.
+_TIER_HEIGHTS = {'4000': 2160, '3000': 1440, '2000': 1080,
+                 '1200': 720, '850': 480, '450': 360}
 
 # Which rung each MeTube quality starts probing from (then walks down).
 _QUALITY_START_INDEX = {
@@ -166,15 +184,18 @@ class Variant:
 
 @dataclass(frozen=True)
 class CctvStream:
-    url: str                    # bare https://...m3u8 URL
+    url: str                    # bare https://...m3u8 URL, or a local
+                                # cctv-h5e proxy URL for source='h5e'
     forced_format: str | None   # media-playlist results force FORCED_FORMAT;
                                 # the master fallback keeps yt-dlp's default
-    source: str                 # 'clear-ladder' | '4k' | 'clear-main' | 'clear-master'
+    source: str                 # 'clear-ladder' | '4k' | 'clear-main' |
+                                # 'clear-master' | 'h5e'
     probed_quality: str | None  # tier that hit, e.g. '2000'
     title: str | None           # from the API, when the entry had none
     encrypted_master: str | None = None
-    # Future H5E work; populated only when the clear path fails and the
-    # encrypted master is reachable (reported in logs, not downloaded).
+    height: int | None = None   # pixel height when known: ladder tiers get
+                                # their nominal height, master variants their
+                                # declared RESOLUTION, h5e its variant height
     encrypted_heights: tuple = field(default=())
 
 
@@ -386,10 +407,55 @@ async def _aiohttp_fetch_checked(session, url, allow_private):
                 return None
             if resp.status != 200:
                 return None
-            body = await resp.content.read(_MAX_BODY_BYTES)
+            # content.read(n) is a size hint, not a promise: on gzip'd CCTV
+            # pages a single read(256K) was observed returning 8KB of a
+            # 131KB body with the rest still inbound. An empty chunk is the
+            # only reliable end-of-body signal, so drain until then (or the
+            # cap); a short-but-nonempty chunk just means "that's what is
+            # decompressed so far".
+            chunks = []
+            received = 0
+            while received < _MAX_BODY_BYTES:
+                chunk = await resp.content.read(_MAX_BODY_BYTES - received)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                received += len(chunk)
+            body = b''.join(chunks)
     except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
         return None
     return body.decode('utf-8', errors='replace')
+
+
+async def _aiohttp_head_checked(session, url, allow_private) -> Optional[int]:
+    """HEAD *url* and return its Content-Length, or None on any miss.
+
+    Used to fingerprint a tier's first segment without transferring it; the
+    same SSRF checks as ``_aiohttp_fetch_checked`` apply because the URL
+    derives from remote API JSON.
+    """
+    loop = asyncio.get_running_loop()
+    err = await loop.run_in_executor(None, partial(validate_url, url, allow_private=allow_private))
+    if err is not None:
+        log.warning('CCTV resolver skipping disallowed URL %s: %s', url, err)
+        return None
+    try:
+        async with session.head(url) as resp:
+            if resp.status != 200:
+                return None
+            value = resp.headers.get('Content-Length')
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
+        return None
+    return int(value) if value and value.isdigit() else None
+
+
+def first_segment_url(playlist_text: str, playlist_url: str) -> Optional[str]:
+    """Absolute URL of the first media segment named in an HLS playlist."""
+    for line in playlist_text.splitlines():
+        line = line.strip()
+        if line and not line.startswith('#'):
+            return urljoin(playlist_url, line)
+    return None
 
 
 async def _probe_encrypted_heights(session, fetch, enc_url):
@@ -404,6 +470,15 @@ async def _probe_encrypted_heights(session, fetch, enc_url):
             if v.resolution)
     except Exception:
         return ()
+
+
+async def _encrypted_hint(session, fetch, enc_url):
+    """Human-readable note about what the H5E-encrypted stream offers."""
+    heights = await _probe_encrypted_heights(session, fetch, enc_url)
+    if heights:
+        return (f'; encrypted stream offers '
+                f'{", ".join(f"{h}p" for h in heights)} (H5E-encrypted)')
+    return f'; encrypted stream at {enc_url} (H5E-encrypted)'
 
 
 async def _fetch_api_info(session, fetch, api_url):
@@ -430,18 +505,52 @@ async def _fetch_api_info(session, fetch, api_url):
     return None
 
 
-async def _resolve_streams(session, fetch, info, ladder):
+async def _resolve_clear(session, fetch, info, ladder, head, enc_url):
+    """Best stream the clear CDN offers (ladder, master fallback, main)."""
     hls_url = strip_maxbr((info.get('hls_url') or '').strip())
     if not hls_url:
         return None
     title = info.get('title')
-    enc_url = encrypted_master_url(info)
     is_4k = 'cctv-4k' in str(info.get('play_channel') or '').lower()
 
-    def stream(url, source, probed_quality, forced_format=FORCED_FORMAT):
+    def stream(url, source, probed_quality, forced_format=FORCED_FORMAT,
+               height=None):
         return CctvStream(
             url=url, forced_format=forced_format, source=source,
-            probed_quality=probed_quality, title=title, encrypted_master=enc_url)
+            probed_quality=probed_quality, title=title,
+            encrypted_master=enc_url, height=height)
+
+    # Fingerprint of the floor (450) tier's first segment, fetched lazily on
+    # the first ladder hit that needs alias validation. Tier directories can
+    # serve another encode's exact bytes (see module docstring), so a hit is
+    # only genuine when its first segment differs from the floor's.
+    floor = {'len': None, 'tried': False}
+
+    async def floor_segment_len():
+        if not floor['tried']:
+            floor['tried'] = True
+            floor_url = clear_variant_url(hls_url, LADDER[-1])
+            if floor_url:
+                text = await fetch(session, floor_url)
+                if text is not None and '#EXTINF' in text:
+                    seg = first_segment_url(text, floor_url)
+                    if seg is not None:
+                        floor['len'] = await head(session, seg)
+        return floor['len']
+
+    async def tier_is_distinct(text, cand):
+        """True/False, or None when it cannot be determined (the caller then
+        treats the hit as genuine -- never worse than today's behaviour)."""
+        seg = first_segment_url(text, cand)
+        if seg is None:
+            return None
+        cand_len = await head(session, seg)
+        if cand_len is None:
+            return None
+        fl = await floor_segment_len()
+        if fl is None:
+            return None
+        return cand_len != fl
 
     # 1) clear-CDN quality-directory ladder, highest requested tier down.
     #    Deliberately BEFORE consulting the master: episode masters are
@@ -464,17 +573,36 @@ async def _resolve_streams(session, fetch, info, ladder):
             # a nested master: take its top variant (the tier is already
             # selected by the directory we asked for)
             chosen = select_variant_by_bandwidth(variants, None)
-            return stream(urljoin(cand, chosen.url), source, q)
+            return stream(urljoin(cand, chosen.url), source, q,
+                          height=_TIER_HEIGHTS.get(q))
         if '#EXTINF' in text:
-            return stream(cand, source, q)
+            # Alias check: the floor tier is genuine by definition and needs
+            # no comparison (against itself it would always look equal).
+            if head is not None and q != LADDER[-1]:
+                distinct = await tier_is_distinct(text, cand)
+                if distinct is False:
+                    log.debug('CCTV: tier %s at %s is an alias of the %s encode; skipping',
+                              q, cand, LADDER[-1])
+                    continue
+            return stream(cand, source, q, height=_TIER_HEIGHTS.get(q))
 
     # 2) last resort: hand yt-dlp the master playlist itself. Its variants
     #    carry real BANDWIDTH/RESOLUTION metadata, so metube's usual format
     #    selectors sort correctly and no format is forced.
     text = await fetch(session, hls_url)
     if text is not None and '#EXT-X-STREAM-INF' in text:
-        if parse_master_variants(text):
-            return stream(hls_url, 'clear-master', None, forced_format=None)
+        variants = parse_master_variants(text)
+        if variants:
+            top = select_variant_by_bandwidth(variants, None)
+            hint = ''
+            top_h = (top.resolution or '').split('x')[-1]
+            top_h = int(top_h) if top_h.isdigit() else None
+            if top_h is not None and top_h < 720 and enc_url:
+                hint = await _encrypted_hint(session, fetch, enc_url)
+            log.info('CCTV: master playlist is the ceiling: top variant %s bps %s%s',
+                     top.bandwidth, top.resolution or '?', hint)
+            return stream(hls_url, 'clear-master', None, forced_format=None,
+                          height=top_h)
 
     # 3) bare media playlist at main/ (the single tier the CDN admits to):
     #    no height metadata -> force the format selector
@@ -484,11 +612,98 @@ async def _resolve_streams(session, fetch, info, ladder):
     return None
 
 
-async def resolve_episode(url, quality, *, entry=None, allow_private=False, _fetch=None):
-    """Resolve a CCTV episode page to its best clear-CDN stream.
+def _variant_height(v: Variant) -> int:
+    """Declared pixel height of a master variant (-1 when absent)."""
+    h = (v.resolution or '').split('x')[-1]
+    return int(h) if h.isdigit() else -1
+
+
+async def _resolve_encrypted(session, fetch, quality, clear, enc_url, title,
+                             h5e_base, h5e_probe):
+    """Serve the encrypted (H5E) stream through the local decrypting proxy,
+    but only when it strictly beats *clear*.
+
+    The encrypted master's variants carry real RESOLUTION metadata (unlike
+    clear media playlists), so 'strictly better' compares the chosen
+    variant's declared height with the clear result's known height. Any
+    failure -- no master, no resolutions, not better, self-check miss --
+    returns None and the caller keeps the clear result (never worse).
+    """
+    if quality == 'worst':
+        return None
+    text = await fetch(session, enc_url)
+    if text is None or '#EXTM3U' not in text:
+        return None
+    variants = [v for v in parse_master_variants(text) if _variant_height(v) > 0]
+    if not variants:
+        return None
+    cap = None if quality in ('best', '2160') else (
+        int(quality) if quality.isdigit() else None)
+    if cap is None:
+        chosen = max(variants, key=lambda v: (_variant_height(v), v.bandwidth))
+    else:
+        eligible = [v for v in variants if _variant_height(v) <= cap]
+        if eligible:
+            chosen = max(eligible, key=lambda v: (_variant_height(v), v.bandwidth))
+        else:  # everything exceeds the cap: take the least-exceeding one
+            chosen = min(variants, key=lambda v: (_variant_height(v), v.bandwidth))
+    enc_h = _variant_height(chosen)
+    # Only the high tiers are worth the decrypting detour, and an encrypted
+    # stream never replaces a strictly better or equal clear result.
+    if enc_h < 720:
+        return None
+    if clear is not None and (clear.height is None or enc_h <= clear.height):
+        return None
+    if h5e_probe is None:
+        h5e_probe = _h5e_probe_default
+    media_url = urljoin(enc_url, chosen.url)
+    try:
+        ok = await h5e_probe(h5e_base, media_url)
+    except Exception:
+        log.warning('CCTV: H5E proxy self-check raised for %s', media_url,
+                    exc_info=True)
+        ok = False
+    if not ok:
+        log.warning('CCTV: H5E proxy self-check failed for %s; keeping the '
+                    'clear stream', media_url)
+        return None
+    tier = re.search(r'/(\d{3,4})(?:/|\.)', chosen.url)
+    log.info('CCTV: encrypted %dp beats clear %s; serving via local H5E proxy',
+             enc_h, f'{clear.height}p' if clear and clear.height else 'none')
+    return CctvStream(
+        url=_h5e_proxy_url(h5e_base, media_url),
+        forced_format=FORCED_FORMAT,
+        source='h5e',
+        probed_quality=tier.group(1) if tier else None,
+        title=title,
+        encrypted_master=enc_url,
+        height=enc_h)
+
+
+async def _resolve_streams(session, fetch, info, ladder, head=None,
+                           quality='best', h5e_base=None, h5e_probe=None):
+    """Clear resolution, then the encrypted upgrade when it strictly wins."""
+    enc_url = encrypted_master_url(info)
+    clear = await _resolve_clear(session, fetch, info, ladder, head, enc_url)
+    if not h5e_base or not enc_url:
+        return clear
+    enc = await _resolve_encrypted(session, fetch, quality, clear, enc_url,
+                                   info.get('title'), h5e_base, h5e_probe)
+    return enc if enc is not None else clear
+
+
+async def resolve_episode(url, quality, *, entry=None, allow_private=False,
+                          _fetch=None, _head=None, h5e_base=None,
+                          _h5e_probe=None):
+    """Resolve a CCTV episode page to its best playable stream.
 
     Returns a CctvStream, or None when anything fails (the caller then
     proceeds exactly as without this module). Raises never.
+
+    *h5e_base* (origin + URL_PREFIX + route of the local decrypting proxy,
+    see cctv_h5e_proxy.proxy_base) additionally allows the H5E-encrypted
+    stream to win when it strictly beats the clear result; *_h5e_probe*
+    overrides the proxy self-check for tests.
     """
     try:
         if not is_cctv_episode_url(url):
@@ -505,8 +720,12 @@ async def resolve_episode(url, quality, *, entry=None, allow_private=False, _fet
 
         if _fetch is not None:
             fetch = _fetch
+            # Stubbed network: alias validation only runs when the stub
+            # provides a HEAD stand-in too.
+            head = _head
         else:
             fetch = partial(_aiohttp_fetch_checked, allow_private=allow_private)
+            head = partial(_aiohttp_head_checked, allow_private=allow_private)
 
         async with aiohttp.ClientSession(timeout=_PROBE_TIMEOUT, headers={'User-Agent': UA}) as session:
             if guid is None:
@@ -521,7 +740,10 @@ async def resolve_episode(url, quality, *, entry=None, allow_private=False, _fet
             if info is None:
                 return None
 
-            result = await _resolve_streams(session, fetch, info, ladder)
+            result = await _resolve_streams(session, fetch, info, ladder,
+                                            head=head, quality=quality,
+                                            h5e_base=h5e_base,
+                                            h5e_probe=_h5e_probe)
 
             if result is not None:
                 _cache_put(cache_key, result)
@@ -529,13 +751,7 @@ async def resolve_episode(url, quality, *, entry=None, allow_private=False, _fet
                 hint = ''
                 enc_url = encrypted_master_url(info)
                 if enc_url:
-                    heights = await _probe_encrypted_heights(session, fetch, enc_url)
-                    if heights:
-                        hint = (f'; encrypted stream offers '
-                                f'{", ".join(f"{h}p" for h in heights)}'
-                                f' (H5E, not downloadable here)')
-                    else:
-                        hint = f'; encrypted stream at {enc_url} (H5E, not downloadable here)'
+                    hint = await _encrypted_hint(session, fetch, enc_url)
                 log.info('CCTV: no clear stream found for %s%s', url, hint)
         return result
     except Exception:

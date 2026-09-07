@@ -21,6 +21,7 @@ from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 from watchfiles import DefaultFilter, Change, awatch
 
 import bg_tasks
+import cctv_h5e_proxy
 from ytdl import DownloadQueueNotifier, DownloadQueue, Download
 from subscriptions import SubscriptionManager, SubscriptionNotifier, SubscriptionInfo, coerce_optional_bool
 from yt_dlp.version import __version__ as yt_dlp_version
@@ -1317,6 +1318,12 @@ if config.URL_PREFIX != '/':
     @routes.get(config.URL_PREFIX[:-1])
     async def index_redirect_dir(request):
         return web.HTTPFound(config.URL_PREFIX)
+
+# Local H5E decrypting proxy for CCTV encrypted streams (app/cctv_h5e_proxy).
+# Registered before the catch-all static route below -- aiohttp resolves
+# routes in registration order.
+cctv_h5e_proxy.register_routes(routes, config.URL_PREFIX)
+app.on_shutdown.append(cctv_h5e_proxy.on_shutdown)
 
 routes.static(config.URL_PREFIX + 'download/', config.DOWNLOAD_DIR, show_index=config.DOWNLOAD_DIRS_INDEXABLE)
 routes.static(config.URL_PREFIX + 'audio_download/', config.AUDIO_DOWNLOAD_DIR, show_index=config.DOWNLOAD_DIRS_INDEXABLE)

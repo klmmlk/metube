@@ -79,6 +79,7 @@ from ytdl import (
     MusicMetadataPreProcessor,
     _compact_persisted_entry,
     _convert_srt_to_txt_file,
+    _cctv_h5e_proxy_origins,
     _pot_provider_urls,
     _AlbumArtistPostProcessor,
     _resolve_outtmpl_fields,
@@ -1350,3 +1351,36 @@ class UpdateStatusFileStatTests(unittest.IsolatedAsyncioTestCase):
             download.notifier.broadcast_statuses,
             ["postprocessing", "downloading", "postprocessing", "finished"],
         )
+
+
+class CctvH5eProxyOriginsTests(unittest.TestCase):
+    def test_proxy_url_yields_its_origin(self):
+        url = 'http://127.0.0.1:8081/cctv-h5e/u/aXNOb3RQcml2YXRl'
+        self.assertEqual(_cctv_h5e_proxy_origins(url),
+                         ('http://127.0.0.1:8081',))
+
+    def test_prefixed_deployment_path_is_recognised(self):
+        url = 'http://127.0.0.1:8081/metube/cctv-h5e/u/aXNOb3RQcml2YXRl'
+        self.assertEqual(_cctv_h5e_proxy_origins(url),
+                         ('http://127.0.0.1:8081',))
+
+    def test_plain_urls_yield_nothing(self):
+        for url in ('https://dh5.cntv.myhwcdn.cn/asp/hls/main/x/main.m3u8',
+                    'https://example.com/cctv-h5e/other/x',  # not the /u/ route
+                    'not a url',
+                    'ftp://127.0.0.1/cctv-h5e/u/x'):       # non-http scheme
+            self.assertEqual(_cctv_h5e_proxy_origins(url), (), url)
+
+    def test_substring_match_is_intentionally_loose(self):
+        # The match is by path substring, not anchored to the path start, so a
+        # non-prefix deployment that happens to put the route later in the
+        # path still extracts the host. This costs nothing: the socket guard
+        # only blocks *private* addresses, private hosts were already rejected
+        # by validate_url at ingress (unless ALLOW_PRIVATE_ADDRESSES, in which
+        # case the guard is off anyway), and any public origin allowed here is
+        # public anyway.
+        url = 'https://example.com/download/cctv-h5e/u/x'
+        self.assertEqual(_cctv_h5e_proxy_origins(url), ('https://example.com',))
+
+    def test_bad_input_never_raises(self):
+        self.assertEqual(_cctv_h5e_proxy_origins('http://[::1:8081/cctv-h5e/u/x'), ())

@@ -262,9 +262,11 @@ async def _aiohttp_fetch_checked(session, url, allow_private):
                 return None
             if resp.status != 200:
                 return None
-            # content.read(n) is a size hint -- a single call may return
-            # fewer bytes than n (TCP segment / chunked encoding). Loop
-            # until the response is drained or we hit the cap.
+            # content.read(n) is a size hint, not a promise: a single call
+            # may return fewer bytes than n with more still inbound (see the
+            # matching loop in cctv.py -- observed on gzip'd CCTV pages).
+            # An empty chunk is the only reliable end-of-body signal, so
+            # drain until then or the cap; never break on a short chunk.
             chunks = []
             received = 0
             while received < _MAX_BODY_BYTES:
@@ -273,9 +275,6 @@ async def _aiohttp_fetch_checked(session, url, allow_private):
                     break
                 chunks.append(chunk)
                 received += len(chunk)
-                if len(chunk) < _MAX_BODY_BYTES - received:
-                    # short read: server finished before we hit the cap
-                    break
             body = b''.join(chunks)
     except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
         return None
