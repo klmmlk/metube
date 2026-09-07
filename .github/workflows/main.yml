@@ -7,6 +7,14 @@ on:
     paths-ignore:
       - '**.md'
 
+# GITHUB_TOKEN's default permission set is read-only for packages, so
+# pushing to ghcr.io fails with "denied: installation not allowed to
+# Create organization package". Explicitly grant packages: write here;
+# all jobs in this workflow use the same token.
+permissions:
+  contents: read
+  packages: write
+
 jobs:
   quality-checks:
     runs-on: ubuntu-latest
