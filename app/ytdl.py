@@ -23,7 +23,7 @@ import yt_dlp.networking.impersonate
 from yt_dlp.postprocessor.common import PostProcessor
 from yt_dlp.utils import STR_FORMAT_RE_TMPL, STR_FORMAT_TYPES
 import bg_tasks
-from cctv import OUTTMPL_PRE_RESOLVE_PREFIXES, RESOLVE_TIMEOUT, is_cctv_episode_url, resolve_episode
+from cctv import OUTTMPL_PRE_RESOLVE_PREFIXES, RESOLVE_TIMEOUT, _VIDA_LANDING_PATH_RE, is_cctv_episode_url, maybe_rewrite_vida_landing, resolve_episode
 from dl_formats import get_format, get_opts, AUDIO_FORMATS, merge_ytdl_option_layers
 from music_metadata import MusicMetadataPreProcessor
 from datetime import datetime
@@ -1672,6 +1672,23 @@ class DownloadQueue:
         # the download exactly as it would have been without this block.
         if (getattr(dl, 'download_type', '') == 'video'
                 and is_cctv_episode_url(dl.url)):
+            # VIDA-prefixed CCTV single-episode URLs are landing pages, not
+            # video pages: their inline JS contains no ``guid`` and yt-dlp's
+            # CCTVIE can't extract a video id, so the default path fails with
+            # "Unable to extract video id". The page itself points at one
+            # VIDE sibling in jsonData2[0] (the same list cctv_series scans
+            # for whole-series expansion) -- rewrite dl.url to that sibling
+            # so the rest of the resolver and yt-dlp see a real episode page.
+            try:
+                rewritten = await asyncio.wait_for(
+                    maybe_rewrite_vida_landing(dl.url,
+                        allow_private=self.config.ALLOW_PRIVATE_ADDRESSES),
+                    timeout=RESOLVE_TIMEOUT)
+            except Exception:
+                rewritten = None
+            if rewritten is not None:
+                log.info('CCTV VIDA landing %s -> %s', dl.url, rewritten)
+                dl.url = rewritten
             try:
                 resolved = await asyncio.wait_for(
                     resolve_episode(

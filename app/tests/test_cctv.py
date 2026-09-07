@@ -20,6 +20,7 @@ from cctv import (
     extract_guid,
     is_cctv_episode_url,
     ladder_for_quality,
+    maybe_rewrite_vida_landing,
     parse_master_variants,
     select_variant_by_bandwidth,
     strip_maxbr,
@@ -27,6 +28,8 @@ from cctv import (
 
 GUID = 'a' * 32
 PAGE = f'https://tv.cctv.com/2024/02/21/VIDE{GUID[:16].upper()}.shtml'
+VIDA_PAGE = 'https://tv.cctv.cn/2026/09/01/VIDAxOhtc2E2Nk3KrBRhYSbY260901.shtml'
+VIDA_SIBLING = 'https://tv.cctv.cn/2026/08/27/VIDE2HwSnTrN1pK5ZHSgz1Z5260827.shtml'
 HLS = 'https://dh5.cntv.myhwcdn.cn/asp/hls/main/MAIN123/abc/main.m3u8'
 
 MEDIA = (
@@ -225,7 +228,7 @@ async def test_resolve_uses_entry_guid_without_page_fetch():
     })
     stream = await cctv.resolve_episode(PAGE, 'best', entry={'id': GUID}, _fetch=fetch)
     assert PAGE not in fetch.requests
-    assert stream.url == f'generic:{variant_url("2000")}'
+    assert stream.url == f'{variant_url("2000")}'
 
 
 async def test_resolve_ladder_probes_from_top():
@@ -238,7 +241,7 @@ async def test_resolve_ladder_probes_from_top():
     stream = await cctv.resolve_episode(PAGE, 'best', entry={'id': GUID}, _fetch=fetch)
     assert stream.source == 'clear-ladder'
     assert stream.probed_quality == '2000'
-    assert stream.url == f'generic:{variant_url("2000")}'
+    assert stream.url == f'{variant_url("2000")}'
     assert stream.forced_format == FORCED_FORMAT
     assert stream.title == '测试节目'
     # tiers below the hit are never probed, nor is the master consulted
@@ -263,7 +266,7 @@ async def test_ladder_beats_incomplete_master():
     stream = await cctv.resolve_episode(PAGE, 'best', entry={'id': GUID}, _fetch=fetch)
     assert stream.source == 'clear-ladder'
     assert stream.probed_quality == '2000'
-    assert stream.url == f'generic:{variant_url("2000")}'
+    assert stream.url == f'{variant_url("2000")}'
 
 
 async def test_resolve_master_fallback_when_ladder_misses():
@@ -276,7 +279,7 @@ async def test_resolve_master_fallback_when_ladder_misses():
     assert stream.source == 'clear-master'
     # the master itself: variants carry real metadata, yt-dlp sorts them,
     # so no format is forced
-    assert stream.url == f'generic:{HLS}'
+    assert stream.url == f'{HLS}'
     assert stream.forced_format is None
     assert stream.probed_quality is None
 
@@ -289,7 +292,7 @@ async def test_resolve_bare_main_media_playlist_when_ladder_misses():
     })
     stream = await cctv.resolve_episode(PAGE, 'worst', entry={'id': GUID}, _fetch=fetch)
     assert stream.source == 'clear-main'
-    assert stream.url == f'generic:{HLS}'
+    assert stream.url == f'{HLS}'
     assert stream.forced_format == FORCED_FORMAT
 
 
@@ -301,7 +304,7 @@ async def test_resolve_ladder_nested_master_takes_top_variant():
     })
     stream = await cctv.resolve_episode(PAGE, 'best', entry={'id': GUID}, _fetch=fetch)
     assert stream.probed_quality == '2000'
-    assert stream.url == f'generic:{urljoin(variant_url("2000"), "2000/index.m3u8")}'
+    assert stream.url == f'{urljoin(variant_url("2000"), "2000/index.m3u8")}'
 
 
 async def test_resolve_4k_channel_uses_main_segment_rewrite():
@@ -313,7 +316,7 @@ async def test_resolve_4k_channel_uses_main_segment_rewrite():
     })
     stream = await cctv.resolve_episode(PAGE, 'best', entry={'id': GUID}, _fetch=fetch)
     assert stream.source == '4k'
-    assert stream.url == 'generic:https://dh5.cntv.myhwcdn.cn/video/4000/ABC123/main.m3u8'
+    assert stream.url == 'https://dh5.cntv.myhwcdn.cn/video/4000/ABC123/main.m3u8'
 
 
 async def test_resolve_worst_only_probes_lowest_tier():
@@ -360,6 +363,74 @@ async def test_resolve_page_guid_fallback():
     stream = await cctv.resolve_episode(PAGE, '1080', _fetch=fetch)
     assert stream is not None
     assert stream.probed_quality == '2000'
+
+
+# --- VIDA landing-page rewrite ---------------------------------------------
+
+VIDA_LANDING_HTML = (
+    "<script>var column_id = \"TOPC1460958044779267\";</script>\n"
+    "var jsonData=[];\n"
+    "var jsonData2=[{\n"
+    "    'title':'第23集',\n"
+    "    'img':'//p5.img.cntv.cn/fmspic/2026/08/27/abc-1.jpg',\n"
+    "    'brief':'简介',\n"
+    f"    'url':'{VIDA_SIBLING}'\n"
+    "},{\n"
+    "    'title':'第24集',\n"
+    "    'url':'https://tv.cctv.cn/2026/08/27/VIDEother123.shtml'\n"
+    "}];\n"
+)
+
+
+async def test_vida_landing_rewrites_to_first_vide_sibling():
+    fetch = FakeFetch({VIDA_PAGE: VIDA_LANDING_HTML})
+    assert await maybe_rewrite_vida_landing(VIDA_PAGE, _fetch=fetch) == VIDA_SIBLING
+
+
+async def test_vida_landing_ignores_query_string():
+    fetch = FakeFetch({VIDA_PAGE + '?spm=from.x.y': VIDA_LANDING_HTML})
+    assert await maybe_rewrite_vida_landing(
+        VIDA_PAGE + '?spm=from.x.y', _fetch=fetch) == VIDA_SIBLING
+
+
+@pytest.mark.parametrize('url', [
+    PAGE,                                # VIDE page: nothing to rewrite
+    'https://tv.cctv.com/lm/xwlb/videoset/',   # series page
+    'https://www.youtube.com/watch?v=abc',
+    'not a url',
+])
+async def test_vida_landing_non_vida_urls_return_none_without_fetch(url):
+    fetch = FakeFetch({})
+    assert await maybe_rewrite_vida_landing(url, _fetch=fetch) is None
+    assert fetch.requests == []
+
+
+@pytest.mark.parametrize('html', [
+    '',                                  # empty body
+    '<html>no jsonData here</html>',     # no sibling list
+    # jsonData2 exists but holds no VIDE URL (only non-episode links)
+    "var jsonData2=[{'title':'x','url':'https://tv.cctv.cn/lm/foo/'}];",
+])
+async def test_vida_landing_fetch_or_regex_miss_returns_none(html):
+    fetch = FakeFetch({VIDA_PAGE: html or None})
+    assert await maybe_rewrite_vida_landing(VIDA_PAGE, _fetch=fetch) is None
+
+
+async def test_vida_landing_takes_first_sibling_not_later_entries():
+    # The regex must anchor on jsonData2's opening [{ and not skip ahead to
+    # a VIDE URL in a later entry or elsewhere on the page.
+    html = (
+        "var jsonData2=[{\n"
+        "    'title':'第1集',\n"
+        "    'url':'https://tv.cctv.cn/2026/08/27/VIDEfirstabc.shtml'\n"
+        "},{\n"
+        "    'title':'第2集',\n"
+        "    'url':'https://tv.cctv.cn/2026/08/27/VIDEsecondabc.shtml'\n"
+        "}];"
+    )
+    fetch = FakeFetch({VIDA_PAGE: html})
+    assert await maybe_rewrite_vida_landing(
+        VIDA_PAGE, _fetch=fetch) == 'https://tv.cctv.cn/2026/08/27/VIDEfirstabc.shtml'
 
 
 @pytest.mark.parametrize('responses', [

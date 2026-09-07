@@ -20,9 +20,13 @@ Never-worse contract: resolve_episode returns None on *any* failure and the
 caller leaves the download exactly as it would have been without this
 module. Two subtleties keep a rewritten download working:
 
-* The m3u8 URL is prefixed with ``generic:`` -- a bare ``*.cntv.cn`` /
-  ``*.cctv.com`` URL would be claimed by yt-dlp's CCTVIE, which then fails
-  to find a guid in the playlist text.
+* The m3u8 URL is returned as a bare ``https://...m3u8`` -- yt-dlp's Generic
+  extractor picks it up directly. Earlier revisions prefixed the URL with
+  ``generic:`` thinking it was a yt-dlp URL scheme, but no request handler
+  (urllib / requests / websockets / curl_cffi) supports that scheme, so the
+  whole download fell over with "Unsupported url scheme: generic". A bare
+  ``*.cntv.cn`` / ``*.cctv.com`` m3u8 is *not* claimed by yt-dlp's CCTVIE
+  (the extractor expects a VIDE/VIDA episode page, not a media playlist).
 * Streams resolved to a single media playlist carry no height metadata, so
   the caller forces the format selector to ``bestvideo+bestaudio/best``; a
   tier filter like ``bestvideo[height<=720]`` would match nothing. The one
@@ -59,6 +63,7 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from functools import partial
+from typing import Optional
 from urllib.parse import urljoin, urlparse, urlencode
 
 import aiohttp
@@ -112,6 +117,16 @@ _API_RETRY_DELAY = 0.5
 # needs both to recognise剧集 source URLs.
 _CCTV_HOSTS = ('tv.cctv.com', 'tv.cctv.cn', 'www.tv.cctv.com', 'www.tv.cctv.cn')
 _EPISODE_PATH_RE = re.compile(r'/VID[AE][0-9A-Za-z]+\.s?html?$')
+# A VIDA-prefixed CCTV path. These are landing pages, not video pages: the
+# page itself carries no playable guid and yt-dlp's CCTVIE refuses to extract
+# a video id from them. The page JS instead points at one VIDE sibling via
+# jsonData2[0] -- rewriting to that URL lets the normal resolver path run.
+_VIDA_LANDING_PATH_RE = re.compile(r'/VIDA[0-9A-Za-z]+\.s?html?$')
+# First VIDE URL found in jsonData2 (the per-episode list some series landing
+# pages embed). Greedy enough to ignore minor whitespace / encoding variations.
+_JSONDATA2_VIDE_RE = re.compile(
+    r"jsonData2\s*=\s*\[\s*\{[^{}]*?'url'\s*:\s*'(https?://[^']+VIDE[^']+\.s?html?)'",
+    re.IGNORECASE)
 _GUID_RE = re.compile(r'^[0-9a-fA-F]{32}$')
 
 # guid extraction from an episode page (the six JS shapes yt-dlp's CCTVIE
@@ -151,7 +166,7 @@ class Variant:
 
 @dataclass(frozen=True)
 class CctvStream:
-    url: str                    # already prefixed with 'generic:'
+    url: str                    # bare https://...m3u8 URL
     forced_format: str | None   # media-playlist results force FORCED_FORMAT;
                                 # the master fallback keeps yt-dlp's default
     source: str                 # 'clear-ladder' | '4k' | 'clear-main' | 'clear-master'
@@ -172,6 +187,48 @@ def is_cctv_episode_url(url: str) -> bool:
     if (parts.hostname or '').lower() not in _CCTV_HOSTS:
         return False
     return bool(_EPISODE_PATH_RE.search(parts.path or '/'))
+
+
+async def maybe_rewrite_vida_landing(url: str, *, allow_private: bool = False,
+                                     _fetch=None) -> Optional[str]:
+    """Rewrite a VIDA landing page to its jsonData2[0] VIDE sibling, if any.
+
+    VIDA-prefixed CCTV pages (e.g. https://tv.cctv.cn/.../VIDAxxx.shtml) are
+    not real video pages: the inline JS has no ``guid`` and yt-dlp's CCTVIE
+    therefore fails with "Unable to extract video id". The same pages embed
+    a JSON list of VIDE siblings in ``jsonData2`` -- the first entry is the
+    episode that CCTV's own client would auto-play. Returning that URL lets
+    the normal single-episode resolver run unchanged. Returns None when the
+    URL isn't a VIDA landing page, the fetch fails, or no VIDE sibling is
+    present (the caller then falls back to the default yt-dlp path).
+    """
+    try:
+        parts = urlparse(url)
+    except ValueError:
+        return None
+    if (parts.hostname or '').lower() not in _CCTV_HOSTS:
+        return None
+    if not _VIDA_LANDING_PATH_RE.search(parts.path or '/'):
+        return None
+    if _fetch is not None:
+        fetch = _fetch
+    else:
+        fetch = partial(_aiohttp_fetch_checked, allow_private=allow_private)
+    try:
+        async with aiohttp.ClientSession(
+                timeout=_PROBE_TIMEOUT, headers={'User-Agent': UA}) as session:
+            html = await fetch(session, url)
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
+        return None
+    if not html:
+        return None
+    m = _JSONDATA2_VIDE_RE.search(html)
+    if not m:
+        return None
+    return m.group(1)
+
+
+
 
 
 def ladder_for_quality(quality: str) -> tuple:
@@ -383,7 +440,7 @@ async def _resolve_streams(session, fetch, info, ladder):
 
     def stream(url, source, probed_quality, forced_format=FORCED_FORMAT):
         return CctvStream(
-            url=f'generic:{url}', forced_format=forced_format, source=source,
+            url=url, forced_format=forced_format, source=source,
             probed_quality=probed_quality, title=title, encrypted_master=enc_url)
 
     # 1) clear-CDN quality-directory ladder, highest requested tier down.
