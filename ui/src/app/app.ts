@@ -87,6 +87,8 @@ export class App implements AfterViewInit, OnInit, OnDestroy {
   playlistItemLimit!: number;
   splitByChapters: boolean;
   sponsorblock: boolean;
+  // Opt-in to expand a single CCTV episode URL into its full season on submit.
+  downloadWholeSeries = false;
   chapterTemplate: string;
   clipStart = '';
   clipEnd = '';
@@ -1124,6 +1126,7 @@ export class App implements AfterViewInit, OnInit, OnDestroy {
       autoStart: overrides.autoStart ?? this.autoStart,
       splitByChapters: overrides.splitByChapters ?? this.splitByChapters,
       sponsorblock: overrides.sponsorblock ?? this.sponsorblock,
+      downloadWholeSeries: overrides.downloadWholeSeries ?? this.downloadWholeSeries,
       chapterTemplate: overrides.chapterTemplate ?? this.chapterTemplate,
       subtitleLanguage: overrides.subtitleLanguage ?? this.subtitleLanguage,
       subtitleMode: overrides.subtitleMode ?? this.subtitleMode,

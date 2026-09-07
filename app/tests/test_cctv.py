@@ -132,6 +132,10 @@ def test_ladder_for_quality_table():
     ('https://tv.cctv.cn/2024/02/21/VIDEAbCdEf123.shtml', True),
     ('https://www.tv.cctv.com/2024/02/21/VIDEAbCdEf123.shtml', True),
     (PAGE + '?spm=noop', True),
+    # VIDA (album) prefix is also a recognised episode URL -- some CCTV
+    # single-episode pages (notably 动画 series) use VIDA in the path even
+    # though cctv_series treats the ID as an album alias.
+    ('https://tv.cctv.cn/2026/09/01/VIDAxOhtc2E2Nk3KrBRhYSbY260901.shtml', True),
     ('https://sports.cctv.com/2024/02/21/ARTIAbCdEf123.shtml', False),
     ('https://tv.cctv.com/lm/xwlb/videoset/', False),
     ('https://www.youtube.com/watch?v=abc', False),

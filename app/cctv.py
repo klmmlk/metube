@@ -105,9 +105,13 @@ _MAX_BODY_BYTES = 256 * 1024
 _API_ATTEMPTS = 3
 _API_RETRY_DELAY = 0.5
 
-# Episode pages we resolve: tv.cctv.com / tv.cctv.cn "VIDE....shtml" URLs.
+# Episode pages we resolve: tv.cctv.com / tv.cctv.cn "VIDE....shtml" or
+# "VIDA....shtml" URLs. Both prefixes occur: VIDE is the standard per-episode
+# id, VIDA is the album id that CCTV also uses as a single-episode URL on
+# some pages (e.g. 动画 series pages). The companion cctv_series module
+# needs both to recognise剧集 source URLs.
 _CCTV_HOSTS = ('tv.cctv.com', 'tv.cctv.cn', 'www.tv.cctv.com', 'www.tv.cctv.cn')
-_EPISODE_PATH_RE = re.compile(r'/VIDE[0-9A-Za-z]+\.s?html?$')
+_EPISODE_PATH_RE = re.compile(r'/VID[AE][0-9A-Za-z]+\.s?html?$')
 _GUID_RE = re.compile(r'^[0-9a-fA-F]{32}$')
 
 # guid extraction from an episode page (the six JS shapes yt-dlp's CCTVIE

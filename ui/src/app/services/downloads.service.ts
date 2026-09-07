@@ -18,6 +18,8 @@ export interface AddDownloadPayload {
   autoStart: boolean;
   splitByChapters: boolean;
   sponsorblock: boolean;
+  // Opt-in for CCTV whole-series expansion; ignored on non-CCTV URLs.
+  downloadWholeSeries?: boolean;
   chapterTemplate: string;
   subtitleLanguage: string;
   subtitleMode: string;
@@ -150,6 +152,7 @@ export class DownloadsService {
       auto_start: payload.autoStart,
       split_by_chapters: payload.splitByChapters,
       sponsorblock: payload.sponsorblock,
+      download_whole_series: payload.downloadWholeSeries ?? false,
       chapter_template: payload.chapterTemplate,
       subtitle_language: payload.subtitleLanguage,
       subtitle_mode: payload.subtitleMode,

@@ -485,6 +485,21 @@
                       [disabled]="addInProgress || subscribeInProgress || downloads.loading">
                   </div>
                 </div>
+                <div class="col-md-6" *ngIf="format === 'video'">
+                  <div class="form-check">
+                    <input type="checkbox"
+                      class="form-check-input"
+                      id="downloadWholeSeries"
+                      name="downloadWholeSeries"
+                      [(ngModel)]="downloadWholeSeries"
+                      [disabled]="addInProgress || subscribeInProgress || downloads.loading">
+                    <label class="form-check-label help-title" for="downloadWholeSeries"
+                      ngbPopover="When submitting a CCTV single-episode URL, try to download the entire season this episode belongs to. Has no effect on other sites."
+                      triggers="click" autoClose="outside" container="body">
+                      Download whole series (CCTV only)
+                    </label>
+                  </div>
+                </div>
                 <div class="col-md-6">
                   <div class="input-group">
                     <span class="input-group-text help-title" ngbPopover="How often to poll subscriptions for new videos." triggers="click" autoClose="outside" container="body">Subscription Check (min)</span>

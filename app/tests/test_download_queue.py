@@ -1638,3 +1638,278 @@ def test_cctv_old_persisted_record_without_forced_format_loads_cleanly(dq_env):
                   reloaded.quality, reloaded.format, {}, reloaded,
                   allow_private=False)
     assert dl.format == 'bestvideo+bestaudio/best'
+
+
+# --- CCTV whole-series (single-episode URL -> full season) -----------------
+
+import cctv_series as _cctv_series  # noqa: E402
+
+
+def _patch_cctv_resolver(monkeypatch, fake_resolve):
+    """Default fake resolver: every episode gets rewritten to a generic m3u8
+    URL with forced_format. Tests that want a different per-episode result
+    can pass their own."""
+    if fake_resolve is None:
+        async def fake_resolve(url, quality, *, entry=None, allow_private=False):
+            return _cctv.CctvStream(
+                url=f'generic:https://x/{url.rsplit("/", 1)[-1]}',
+                forced_format=_cctv.FORCED_FORMAT,
+                source='clear-ladder', probed_quality='2000', title='t')
+    else:
+        fake_resolve = fake_resolve
+    monkeypatch.setattr(_ytdl, 'resolve_episode', fake_resolve)
+
+
+async def test_cctv_whole_series_episode_expands_to_siblings(dq_env, monkeypatch):
+    """checkbox=true on a CCTV single-episode URL triggers whole-series
+    detection; the queue ends up with every returned sibling episode."""
+    notifier = AsyncMock()
+    sibling_eps = [
+        'https://tv.cctv.cn/2024/03/02/VIDE0000000000000000000000000000002.shtml',
+        'https://tv.cctv.cn/2024/03/03/VIDE0000000000000000000000000000003.shtml',
+        'https://tv.cctv.cn/2024/03/04/VIDE0000000000000000000000000000004.shtml',
+    ]
+
+    async def fake_series(url, *, allow_private=False, _fetch=None):
+        return _cctv_series.SeriesResult(
+            kind=_cctv_series.SeriesKind.SERIES,
+            episodes=sibling_eps,
+            column_id='TOPC1', source='html-fallback')
+
+    _patch_cctv_resolver(monkeypatch, None)
+    monkeypatch.setattr(_ytdl, 'fetch_series_episodes', fake_series)
+    monkeypatch.setattr(_ytdl, 'expand_url', AsyncMock(return_value=[]))
+
+    def fake_extract(self, url, *_args, **_kwargs):
+        return {'_type': 'video', 'id': 'a' * 32, 'title': 't',
+                'url': url, 'webpage_url': url}
+
+    dq = DownloadQueue(dq_env, notifier)
+    with patch.object(DownloadQueue, '_DownloadQueue__extract_info', fake_extract):
+        result = await dq.add(CCTV_EP, 'video', 'auto', 'any', 'best',
+                              '', '', 0, auto_start=False,
+                              download_whole_series=True)
+
+    assert result['status'] == 'ok'
+    # Each sibling is queued as its rewritten generic URL; the original
+    # episode URL is not queued on its own (it is among the siblings).
+    for ep in sibling_eps:
+        rewritten = f'generic:https://x/{ep.rsplit("/", 1)[-1]}'
+        assert dq.pending.exists(rewritten), f'missing {ep}'
+
+
+async def test_cctv_whole_series_url_marker_is_equivalent_to_checkbox(dq_env, monkeypatch):
+    """?cctv_all=true on the URL is normalised to download_whole_series=True
+    without the caller having to pass the flag explicitly."""
+    notifier = AsyncMock()
+    sibling_eps = [CCTV_EP.replace('AbcdEf', 'BcdeFg')]
+
+    async def fake_series(url, *, allow_private=False, _fetch=None):
+        # url carries the marker -- it must be passed through unchanged
+        assert 'cctv_all=true' in url
+        return _cctv_series.SeriesResult(
+            kind=_cctv_series.SeriesKind.SERIES, episodes=sibling_eps,
+            column_id='TOPC1', source='column-api')
+
+    _patch_cctv_resolver(monkeypatch, None)
+    monkeypatch.setattr(_ytdl, 'fetch_series_episodes', fake_series)
+    monkeypatch.setattr(_ytdl, 'expand_url', AsyncMock(return_value=[]))
+
+    def fake_extract(self, url, *_args, **_kwargs):
+        return {'_type': 'video', 'id': 'a' * 32, 'title': 't',
+                'url': url, 'webpage_url': url}
+
+    dq = DownloadQueue(dq_env, notifier)
+    with patch.object(DownloadQueue, '_DownloadQueue__extract_info', fake_extract):
+        result = await dq.add(CCTV_EP + '?cctv_all=true', 'video', 'auto', 'any', 'best',
+                              '', '', 0, auto_start=False)  # no kwarg!
+
+    assert result['status'] == 'ok'
+    rewritten = f'generic:https://x/{sibling_eps[0].rsplit("/", 1)[-1]}'
+    assert dq.pending.exists(rewritten)
+
+
+async def test_cctv_whole_series_falls_back_to_single_when_kind_is_single(dq_env, monkeypatch):
+    """fetch_series_episodes reports SINGLE (API confirmed this is not a
+    series): the URL enters the queue as a single download, same as no
+    checkbox."""
+    notifier = AsyncMock()
+
+    async def fake_series(url, *, allow_private=False, _fetch=None):
+        return _cctv_series.SeriesResult(
+            kind=_cctv_series.SeriesKind.SINGLE,
+            column_id='TOPC1', source='column-api')
+
+    _patch_cctv_resolver(monkeypatch, None)
+    monkeypatch.setattr(_ytdl, 'fetch_series_episodes', fake_series)
+
+    def fake_extract(self, url, *_args, **_kwargs):
+        return {'_type': 'video', 'id': 'a' * 32, 'title': 't',
+                'url': url, 'webpage_url': url}
+
+    dq = DownloadQueue(dq_env, notifier)
+    with patch.object(DownloadQueue, '_DownloadQueue__extract_info', fake_extract):
+        result = await dq.add(CCTV_EP, 'video', 'auto', 'any', 'best',
+                              '', '', 0, auto_start=False,
+                              download_whole_series=True)
+
+    assert result['status'] == 'ok'
+    # Single-episode path: rewritten generic URL present, no extra siblings.
+    rewritten = f'generic:https://x/{CCTV_EP.rsplit("/", 1)[-1]}'
+    assert dq.pending.exists(rewritten)
+
+
+async def test_cctv_whole_series_swallows_detection_exception(dq_env, monkeypatch):
+    """If fetch_series_episodes raises, the URL must still enter the queue
+    exactly like an un-checked single-episode submission."""
+    notifier = AsyncMock()
+
+    async def exploding_series(url, *, allow_private=False, _fetch=None):
+        raise RuntimeError('boom')
+
+    _patch_cctv_resolver(monkeypatch, None)
+    monkeypatch.setattr(_ytdl, 'fetch_series_episodes', exploding_series)
+
+    def fake_extract(self, url, *_args, **_kwargs):
+        return {'_type': 'video', 'id': 'a' * 32, 'title': 't',
+                'url': url, 'webpage_url': url}
+
+    dq = DownloadQueue(dq_env, notifier)
+    with patch.object(DownloadQueue, '_DownloadQueue__extract_info', fake_extract):
+        result = await dq.add(CCTV_EP, 'video', 'auto', 'any', 'best',
+                              '', '', 0, auto_start=False,
+                              download_whole_series=True)
+
+    assert result['status'] == 'ok'
+    rewritten = f'generic:https://x/{CCTV_EP.rsplit("/", 1)[-1]}'
+    assert dq.pending.exists(rewritten)
+
+
+async def test_cctv_whole_series_recursion_never_double_calls(dq_env, monkeypatch):
+    """When the recursive per-sibling add() runs, download_whole_series is
+    forced to False so a sibling cannot trigger another series detection
+    API call. The series detector must be called exactly once."""
+    notifier = AsyncMock()
+    sibling_eps = [
+        'https://tv.cctv.cn/2024/03/02/VIDE0000000000000000000000000000002.shtml',
+        'https://tv.cctv.cn/2024/03/03/VIDE0000000000000000000000000000003.shtml',
+    ]
+    call_count = {'n': 0}
+
+    async def fake_series(url, *, allow_private=False, _fetch=None):
+        call_count['n'] += 1
+        return _cctv_series.SeriesResult(
+            kind=_cctv_series.SeriesKind.SERIES, episodes=sibling_eps,
+            column_id='TOPC1', source='html-fallback')
+
+    _patch_cctv_resolver(monkeypatch, None)
+    monkeypatch.setattr(_ytdl, 'fetch_series_episodes', fake_series)
+    monkeypatch.setattr(_ytdl, 'expand_url', AsyncMock(return_value=[]))
+
+    def fake_extract(self, url, *_args, **_kwargs):
+        return {'_type': 'video', 'id': 'a' * 32, 'title': 't',
+                'url': url, 'webpage_url': url}
+
+    dq = DownloadQueue(dq_env, notifier)
+    with patch.object(DownloadQueue, '_DownloadQueue__extract_info', fake_extract):
+        await dq.add(CCTV_EP, 'video', 'auto', 'any', 'best',
+                     '', '', 0, auto_start=False,
+                     download_whole_series=True)
+
+    # Exactly one detector call (the original) -- never re-entered.
+    assert call_count['n'] == 1
+
+
+async def test_cctv_whole_series_unknown_source_no_expansion(dq_env, monkeypatch):
+    """Unknown result (detection simply couldn't tell) -> single-episode
+    fallback. The detector must NOT be invoked a second time when the
+    recursive add() resolves that single URL."""
+    notifier = AsyncMock()
+
+    async def fake_series(url, *, allow_private=False, _fetch=None):
+        return _cctv_series.SeriesResult(
+            kind=_cctv_series.SeriesKind.UNKNOWN, source='none')
+
+    _patch_cctv_resolver(monkeypatch, None)
+    monkeypatch.setattr(_ytdl, 'fetch_series_episodes', fake_series)
+
+    def fake_extract(self, url, *_args, **_kwargs):
+        return {'_type': 'video', 'id': 'a' * 32, 'title': 't',
+                'url': url, 'webpage_url': url}
+
+    dq = DownloadQueue(dq_env, notifier)
+    with patch.object(DownloadQueue, '_DownloadQueue__extract_info', fake_extract):
+        result = await dq.add(CCTV_EP, 'video', 'auto', 'any', 'best',
+                              '', '', 0, auto_start=False,
+                              download_whole_series=True)
+
+    assert result['status'] == 'ok'
+    rewritten = f'generic:https://x/{CCTV_EP.rsplit("/", 1)[-1]}'
+    assert dq.pending.exists(rewritten)
+
+
+async def test_cctv_whole_series_playlist_item_limit_caps_expansion(dq_env, monkeypatch):
+    """playlist_item_limit clips the episode list before recursion."""
+    notifier = AsyncMock()
+    sibling_eps = [
+        f'https://tv.cctv.cn/2024/03/0{i+2}/VIDE000000000000000000000000000000{i+2}.shtml'
+        for i in range(5)
+    ]
+
+    async def fake_series(url, *, allow_private=False, _fetch=None):
+        return _cctv_series.SeriesResult(
+            kind=_cctv_series.SeriesKind.SERIES, episodes=sibling_eps,
+            column_id='TOPC1', source='html-fallback')
+
+    _patch_cctv_resolver(monkeypatch, None)
+    monkeypatch.setattr(_ytdl, 'fetch_series_episodes', fake_series)
+    monkeypatch.setattr(_ytdl, 'expand_url', AsyncMock(return_value=[]))
+
+    def fake_extract(self, url, *_args, **_kwargs):
+        return {'_type': 'video', 'id': 'a' * 32, 'title': 't',
+                'url': url, 'webpage_url': url}
+
+    dq = DownloadQueue(dq_env, notifier)
+    with patch.object(DownloadQueue, '_DownloadQueue__extract_info', fake_extract):
+        await dq.add(CCTV_EP, 'video', 'auto', 'any', 'best',
+                     '', '', 2, auto_start=False,  # limit to 2
+                     download_whole_series=True)
+
+    # Only the first two siblings were queued; the other three weren't.
+    for ep in sibling_eps[:2]:
+        rewritten = f'generic:https://x/{ep.rsplit("/", 1)[-1]}'
+        assert dq.pending.exists(rewritten)
+    for ep in sibling_eps[2:]:
+        rewritten = f'generic:https://x/{ep.rsplit("/", 1)[-1]}'
+        assert not dq.pending.exists(rewritten)
+
+
+async def test_cctv_non_episode_url_ignores_whole_series_flag(dq_env, monkeypatch):
+    """download_whole_series=True has no effect on non-CCTV URLs: the
+    detector is never called and the regular yt-dlp path runs."""
+    notifier = AsyncMock()
+    calls = {'n': 0}
+
+    async def fake_series(url, *, allow_private=False, _fetch=None):
+        calls['n'] += 1
+        return _cctv_series.SeriesResult(
+            kind=_cctv_series.SeriesKind.SERIES, episodes=['x'],
+            column_id='X', source='column-api')
+
+    _patch_cctv_resolver(monkeypatch, None)
+    monkeypatch.setattr(_ytdl, 'fetch_series_episodes', fake_series)
+    monkeypatch.setattr(_ytdl, 'expand_url', AsyncMock(return_value=[]))
+
+    yt_url = 'https://www.youtube.com/watch?v=dQw4w9WgXcQ'
+
+    def fake_extract(self, url, *_args, **_kwargs):
+        return {'_type': 'video', 'id': 'a' * 32, 'title': 't',
+                'url': url, 'webpage_url': url}
+
+    dq = DownloadQueue(dq_env, notifier)
+    with patch.object(DownloadQueue, '_DownloadQueue__extract_info', fake_extract):
+        await dq.add(yt_url, 'video', 'auto', 'any', 'best',
+                     '', '', 0, auto_start=False,
+                     download_whole_series=True)
+
+    assert calls['n'] == 0

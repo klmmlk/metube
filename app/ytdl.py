@@ -17,6 +17,7 @@ import signal
 import sys
 import types
 from typing import Any, Optional
+from urllib.parse import urlparse, parse_qs
 
 import yt_dlp.networking.impersonate
 from yt_dlp.postprocessor.common import PostProcessor
@@ -27,6 +28,7 @@ from dl_formats import get_format, get_opts, AUDIO_FORMATS, merge_ytdl_option_la
 from music_metadata import MusicMetadataPreProcessor
 from datetime import datetime
 from site_expanders import expand_url, is_cctv_url
+from cctv_series import fetch_series_episodes, SeriesKind
 from state_store import AtomicJsonStore, from_json_compatible, read_legacy_shelf, to_json_compatible
 from subscriptions import _entry_id
 from url_guard import validate_url, install_socket_guard
@@ -487,6 +489,7 @@ class DownloadInfo:
         live_release_timestamp=None,
         sponsorblock=False,
         forced_format=None,
+        download_whole_series=False,
     ):
         self.id = id if len(custom_name_prefix) == 0 else f'{custom_name_prefix}.{id}'
         self.title = title if len(custom_name_prefix) == 0 else f'{custom_name_prefix}.{title}'
@@ -510,6 +513,11 @@ class DownloadInfo:
         self.playlist_item_limit = playlist_item_limit
         self.split_by_chapters = split_by_chapters
         self.sponsorblock = sponsorblock
+        # Only meaningful on the *first* add of a CCTV episode URL; after the
+        # whole-series expansion recurses, every descendant carries
+        # download_whole_series=False. Persisted so retries keep the original
+        # intent across restarts.
+        self.download_whole_series = bool(download_whole_series)
         self.chapter_template = chapter_template
         self.subtitle_language = subtitle_language
         self.subtitle_mode = subtitle_mode
@@ -613,6 +621,11 @@ class DownloadInfo:
             self.live_status = None
         if not hasattr(self, "live_release_timestamp"):
             self.live_release_timestamp = None
+        if not hasattr(self, "download_whole_series"):
+            # Pre-CCTV-series feature: persisted records from before this
+            # field existed default to the original conservative behaviour
+            # (treat the URL as a single episode).
+            self.download_whole_series = False
 
 
 _PERSISTED_DOWNLOAD_FIELDS = (
@@ -629,6 +642,7 @@ _PERSISTED_DOWNLOAD_FIELDS = (
     "playlist_item_limit",
     "split_by_chapters",
     "sponsorblock",
+    "download_whole_series",
     "chapter_template",
     "subtitle_language",
     "subtitle_mode",
@@ -1799,6 +1813,7 @@ class DownloadQueue:
         _add_gen=None,
         retry_entry=None,
         sponsorblock=False,
+        download_whole_series=False,
     ):
         if not entry:
             return {'status': 'error', 'msg': "Invalid/empty data was given."}
@@ -1843,6 +1858,7 @@ class DownloadQueue:
                 _add_gen,
                 retry_entry,
                 sponsorblock=sponsorblock,
+                download_whole_series=False,
             )
         elif etype == 'playlist' or etype == 'channel':
             if etype == 'playlist' and self.__is_channel_extraction(entry):
@@ -1911,6 +1927,10 @@ class DownloadQueue:
                         already,
                         _add_gen,
                         sponsorblock=sponsorblock,
+                        # See comment in add(): a yt-dlp-level playlist entry
+                        # inside an already-expanded CCTV series must not
+                        # re-trigger the cctv_series API call.
+                        download_whole_series=False,
                     )
                 )
             if any(res['status'] == 'error' for res in results):
@@ -2033,6 +2053,7 @@ class DownloadQueue:
         _add_gen=None,
         retry_entry=None,
         sponsorblock=False,
+        download_whole_series=False,
     ):
         if ytdl_options_presets is None:
             ytdl_options_presets = []
@@ -2040,6 +2061,7 @@ class DownloadQueue:
             f'adding {url}: {download_type=} {codec=} {format=} {quality=} {already=} {folder=} {custom_name_prefix=} '
             f'{playlist_item_limit=} {auto_start=} {split_by_chapters=} {chapter_template=} '
             f'{subtitle_language=} {subtitle_mode=} {ytdl_options_presets=} {clip_start=} {clip_end=} {sponsorblock=}'
+            f' {download_whole_series=}'
         )
         if already is None:
             _add_gen = self._add_generation
@@ -2088,12 +2110,62 @@ class DownloadQueue:
                         split_by_chapters, chapter_template, subtitle_language,
                         subtitle_mode, ytdl_options_presets, ytdl_options_overrides,
                         clip_start, clip_end,
-                        already=already, _add_gen=_add_gen, sponsorblock=sponsorblock))
+                        already=already, _add_gen=_add_gen, sponsorblock=sponsorblock,
+                        download_whole_series=False))
                 errors = [r.get('msg') for r in results if r.get('status') == 'error']
                 if errors:
                     return {'status': 'error',
                             'msg': f'{len(errors)} of {len(episodes)} episodes failed: {errors[0]}'}
                 return {'status': 'ok'}
+        # Whole-series opt-in for a single CCTV episode URL: the user ticked
+        # the "download whole series" checkbox, or appended ?cctv_all=true to
+        # the URL (power-user shortcut). When the cctv_series module can
+        # identify the season this episode belongs to, expand it; otherwise
+        # fall through to the normal single-episode path.
+        cctv_all_marker = False
+        if download_type == 'video' and is_cctv_episode_url(url):
+            try:
+                qs = parse_qs(urlparse(url).query)
+                cctv_all_marker = qs.get('cctv_all', [''])[0].lower() in ('1', 'true', 'yes')
+            except Exception:
+                cctv_all_marker = False
+        whole_series = bool(download_whole_series) or cctv_all_marker
+        if whole_series and download_type == 'video' and is_cctv_episode_url(url):
+            try:
+                result = await asyncio.wait_for(
+                    fetch_series_episodes(
+                        url, allow_private=self.config.ALLOW_PRIVATE_ADDRESSES),
+                    timeout=20)
+            except Exception:
+                log.warning('CCTV series detection failed for %s; falling back to single-episode download',
+                            url, exc_info=True)
+                result = None
+            if result is not None and result.kind is SeriesKind.SERIES and result.episodes:
+                episodes = result.episodes
+                if playlist_item_limit > 0:
+                    episodes = episodes[:playlist_item_limit]
+                log.info('CCTV series: %s -> %d episodes (column_id=%s source=%s)',
+                         url, len(episodes), result.column_id, result.source)
+                results = []
+                for ep in episodes:
+                    results.append(await self.add(
+                        ep, download_type, codec, format, quality, folder,
+                        custom_name_prefix, playlist_item_limit, auto_start,
+                        split_by_chapters, chapter_template, subtitle_language,
+                        subtitle_mode, ytdl_options_presets, ytdl_options_overrides,
+                        clip_start, clip_end,
+                        already=already, _add_gen=_add_gen,
+                        sponsorblock=sponsorblock,
+                        # Recursion must NOT re-enter whole-series detection;
+                        # the already-set above is the second guard.
+                        download_whole_series=False))
+                errors = [r.get('msg') for r in results if r.get('status') == 'error']
+                if errors:
+                    return {'status': 'error',
+                            'msg': f'{len(errors)} of {len(episodes)} episodes failed: {errors[0]}'}
+                return {'status': 'ok'}
+            # Single/unknown/None -> fall through to the standard
+            # single-episode path below; never worse than not opting in.
         try:
             entry = await asyncio.get_running_loop().run_in_executor(
                 None,
@@ -2133,6 +2205,11 @@ class DownloadQueue:
             _add_gen,
             retry_entry,
             sponsorblock=sponsorblock,
+            # Inside the queue the per-episode path already ran; the
+            # whole-series decision was made (and possibly expanded) at the
+            # outer add() call. Pass False so a nested playlist entry from
+            # yt-dlp can never re-trigger the API call.
+            download_whole_series=False,
         )
 
     async def retry(self, id):
@@ -2170,6 +2247,10 @@ class DownloadQueue:
             info.clip_end,
             retry_entry=info.entry,
             sponsorblock=info.sponsorblock,
+            # Persisted intent: re-expand the whole series on retry. already
+            # guard + the False branch inside the recursive add() prevent
+            # exponential fan-out.
+            download_whole_series=info.download_whole_series,
         )
 
     async def add_entry(
