@@ -2174,6 +2174,15 @@ class DownloadQueue:
                          url, len(episodes), result.column_id, result.source)
                 results = []
                 for ep in episodes:
+                    # Mirror yt-dlp playlist expansion: respect the user's
+                    # cancel mid-loop. Without this check the user has no way
+                    # to abort a whole-series add until every episode is
+                    # already in the queue.
+                    if _add_gen is not None and self._add_generation != _add_gen:
+                        log.info('CCTV series add canceled after %d episodes',
+                                 len(already))
+                        return {'status': 'ok',
+                                'msg': f'Canceled - added {len(already)} items before cancel'}
                     results.append(await self.add(
                         ep, download_type, codec, format, quality, folder,
                         custom_name_prefix, playlist_item_limit, auto_start,

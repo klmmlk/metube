@@ -1918,3 +1918,63 @@ async def test_cctv_non_episode_url_ignores_whole_series_flag(dq_env, monkeypatc
                      download_whole_series=True)
 
     assert calls['n'] == 0
+
+
+async def test_cctv_whole_series_cancel_halts_mid_expansion(dq_env, monkeypatch):
+    """User clicks cancel in the UI while the whole-series loop is still
+    adding episodes. The series expansion must abort on the next iteration:
+    later siblings must NOT be queued, and the return value must signal
+    that we stopped because of cancel (status='ok' + msg starting with
+    'Canceled').
+
+    Cancellation fires from inside an in-flight extract_info. That extract
+    still completes and queues its episode; only the *next* iteration's
+    cancel check trips. So cancelling on the 3rd extract means episodes
+    0..2 are queued and 3..4 are not.
+    """
+    notifier = AsyncMock()
+    sibling_eps = [
+        f'https://tv.cctv.cn/2024/03/{i + 2:02d}/VIDE'
+        f'000000000000000000000000000000{i}.shtml'
+        for i in range(5)
+    ]
+
+    async def fake_series(url, *, allow_private=False, _fetch=None):
+        return _cctv_series.SeriesResult(
+            kind=_cctv_series.SeriesKind.SERIES, episodes=sibling_eps,
+            column_id='TOPC1', source='html-fallback')
+
+    _patch_cctv_resolver(monkeypatch, None)
+    monkeypatch.setattr(_ytdl, 'fetch_series_episodes', fake_series)
+    monkeypatch.setattr(_ytdl, 'expand_url', AsyncMock(return_value=[]))
+
+    dq = DownloadQueue(dq_env, notifier)
+    calls = {'n': 0}
+
+    def fake_extract(self, url, *_args, **_kwargs):
+        calls['n'] += 1
+        if calls['n'] == 3:
+            # Cancel during the 3rd sibling's extract; that extract still
+            # finishes and queues its episode, but the loop aborts before
+            # the 4th sibling starts.
+            dq.cancel_add()
+        return {'_type': 'video', 'id': 'a' * 32, 'title': 't',
+                'url': url, 'webpage_url': url}
+
+    with patch.object(DownloadQueue, '_DownloadQueue__extract_info', fake_extract):
+        result = await dq.add(CCTV_EP, 'video', 'auto', 'any', 'best',
+                              '', '', 0, auto_start=False,
+                              download_whole_series=True)
+
+    # Three siblings are queued (the in-flight one still finishes); the
+    # remaining two must not be.
+    for ep in sibling_eps[:3]:
+        rewritten = f'generic:https://x/{ep.rsplit("/", 1)[-1]}'
+        assert dq.pending.exists(rewritten), f'missing pre-cancel {ep}'
+    for ep in sibling_eps[3:]:
+        rewritten = f'generic:https://x/{ep.rsplit("/", 1)[-1]}'
+        assert not dq.pending.exists(rewritten), f'queued after cancel: {ep}'
+    # The outer add() returns the canceled status so the UI can show a
+    # friendly toast instead of an error.
+    assert result['status'] == 'ok'
+    assert result['msg'].startswith('Canceled'), result

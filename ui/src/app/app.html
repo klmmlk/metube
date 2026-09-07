@@ -485,7 +485,7 @@
                       [disabled]="addInProgress || subscribeInProgress || downloads.loading">
                   </div>
                 </div>
-                @if (format === 'video') {
+                @if (downloadType === 'video') {
                   <div class="col-md-6">
                     <div class="form-check">
                       <input type="checkbox"
