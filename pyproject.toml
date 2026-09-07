@@ -1,27 +1,19 @@
-[project]
-name = "metube"
-version = "0.1.0"
-description = "Web GUI for youtube-dl (using yt-dlp) with playlist support"
-requires-python = ">=3.13"
-dependencies = [
-    "aiohttp",
-    "python-socketio>=5.0,<6.0",
-    "yt-dlp[default,curl-cffi,deno]",
-    "mutagen",
-    "curl-cffi",
-    "watchfiles",
-]
-
-[dependency-groups]
-dev = [
-    "pylint",
-    "pytest>=8.0",
-    "pytest-aiohttp>=1.0",
-    "pytest-asyncio>=0.24",
-]
-
-[tool.pytest.ini_options]
-asyncio_mode = "auto"
-testpaths = ["app/tests"]
-pythonpath = [".", "app"]
-addopts = "-v"
+@@
+ [project]
+ name = "metube"
+ version = "0.1.0"
+@@
+ dependencies = [
+     "aiohttp",
+     "python-socketio>=5.0,<6.0",
+-    "yt-dlp[default,curl-cffi,deno]",
++    "yt-dlp[default,curl-cffi,deno]",
+     "mutagen",
+     "curl-cffi",
+-    "watchfiles",
++    "watchfiles",
++    "requests",
++    "beautifulsoup4",
+ ]
+@@
+ 
