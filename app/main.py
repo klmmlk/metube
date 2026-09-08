@@ -231,6 +231,7 @@ class Config:
         'DEFAULT_OPTION_PLAYLIST_ITEM_LIMIT',
         'SUBSCRIPTION_DEFAULT_CHECK_INTERVAL',
         'ALLOW_YTDL_OPTIONS_OVERRIDES',
+        'MAX_CONCURRENT_DOWNLOADS',
     )
 
     def frontend_safe(self) -> dict:
@@ -946,6 +947,20 @@ async def cancel_add(request):
     return web.Response(text=serializer.encode({'status': 'ok'}), content_type='application/json')
 
 
+@routes.patch(config.URL_PREFIX + 'settings')
+async def settings(request):
+    """PATCH {max_concurrent: int} — resize the live download semaphore."""
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({'error': 'invalid JSON'}, status=400)
+    mc = body.get('max_concurrent')
+    if not isinstance(mc, int) or mc < 1 or mc > 20:
+        return web.json_response({'error': 'max_concurrent must be an integer between 1 and 20'}, status=400)
+    dqueue.set_max_concurrent(mc)
+    return web.json_response({'max_concurrent': mc})
+
+
 @routes.post(config.URL_PREFIX + 'retry')
 async def retry(request):
     # Singular by design, unlike the 'ids' batch endpoints: a retry re-extracts
@@ -1350,6 +1365,7 @@ app.router.add_route('OPTIONS', config.URL_PREFIX + 'subscriptions/delete', add_
 app.router.add_route('OPTIONS', config.URL_PREFIX + 'subscriptions/check', add_cors)
 app.router.add_route('OPTIONS', config.URL_PREFIX + 'upload-cookies', add_cors)
 app.router.add_route('OPTIONS', config.URL_PREFIX + 'delete-cookies', add_cors)
+app.router.add_route('OPTIONS', config.URL_PREFIX + 'settings', add_cors)
 
 async def on_prepare(request, response):
     origin = request.headers.get('Origin')

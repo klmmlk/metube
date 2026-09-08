@@ -1353,6 +1353,29 @@ class DownloadQueue:
         self._live_monitor_task: Optional[asyncio.Task] = None
         self._live_monitor_wakeup = asyncio.Event()
 
+    def set_max_concurrent(self, n: int) -> None:
+        """Resize the download semaphore at runtime.
+
+        Shrinking waits for excess permits to be released by completing
+        downloads before adjusting the counter, so in-flight downloads are
+        never abruptly terminated. Grows instantly.
+        """
+        n = max(1, min(n, 20))
+        current = self.semaphore._value
+        if n > current:
+            self.semaphore._value = n
+            log.info('DownloadQueue max_concurrent increased to %d', n)
+        elif n < current:
+            # Shrink: release surplus permits so active slots run down to n
+            # before the counter is updated. Do this synchronously so the
+            # caller (HTTP handler) returns immediately; the semaphore's
+            # internal counter is adjusted here but real permits are only
+            # consumed/released as downloads complete.
+            for _ in range(current - n):
+                self.semaphore.release()
+            self.semaphore._value = n
+            log.info('DownloadQueue max_concurrent decreased to %d', n)
+
     def cancel_add(self):
         self._add_generation += 1
         log.info('Playlist add operation canceled by user')

@@ -1978,3 +1978,39 @@ async def test_cctv_whole_series_cancel_halts_mid_expansion(dq_env, monkeypatch)
     # friendly toast instead of an error.
     assert result['status'] == 'ok'
     assert result['msg'].startswith('Canceled'), result
+
+
+def test_set_max_concurrent_grows_semaphore(dq_env):
+    notifier = MagicMock()
+    dq = DownloadQueue(dq_env, notifier)
+    assert dq.semaphore._value == 3  # default from dq_env
+    dq.set_max_concurrent(7)
+    assert dq.semaphore._value == 7
+    dq.close()
+
+
+def test_set_max_concurrent_shrinks_semaphore(dq_env):
+    notifier = MagicMock()
+    dq = DownloadQueue(dq_env, notifier)
+    assert dq.semaphore._value == 3
+    dq.set_max_concurrent(1)
+    assert dq.semaphore._value == 1
+    dq.close()
+
+
+def test_set_max_concurrent_hard_capped_at_20(dq_env):
+    notifier = MagicMock()
+    dq = DownloadQueue(dq_env, notifier)
+    dq.set_max_concurrent(99)
+    assert dq.semaphore._value == 20
+    dq.close()
+
+
+def test_set_max_concurrent_min_is_1(dq_env):
+    notifier = MagicMock()
+    dq = DownloadQueue(dq_env, notifier)
+    dq.set_max_concurrent(0)
+    assert dq.semaphore._value == 1
+    dq.set_max_concurrent(-5)
+    assert dq.semaphore._value == 1
+    dq.close()
