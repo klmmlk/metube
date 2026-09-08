@@ -781,6 +781,20 @@
         </tbody>
       </table>
     </div>
+    <div class="px-2 py-2 border-top d-flex align-items-center gap-2">
+      <span class="text-muted small">Max concurrent downloads:</span>
+      <input
+        type="number"
+        class="form-control form-control-sm"
+        style="width: 60px"
+        min="1"
+        max="20"
+        [(ngModel)]="maxConcurrentDownloads"
+        (ngModelChange)="maxConcurrentDownloadsChanged()"
+        (keydown)="isNumber($event)"
+        [attr.aria-label]="'Max concurrent downloads'"
+      >
+    </div>
   }
 
   <div class="metube-section-header">

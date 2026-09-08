@@ -174,6 +174,12 @@ export class DownloadsService {
     );
   }
 
+  public setMaxConcurrent(n: number) {
+    return this.http.patch<{ max_concurrent: number }>('settings', {max_concurrent: n}).pipe(
+      catchError(this.handleHTTPError)
+    );
+  }
+
   public retry(id: string) {
     return this.http.post<Status>('retry', { id: id }).pipe(
       catchError(this.handleHTTPError)

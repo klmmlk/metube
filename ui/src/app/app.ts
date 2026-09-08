@@ -101,6 +101,7 @@ export class App implements AfterViewInit, OnInit, OnDestroy {
   cancelRequested = false;
   subscribeInProgress = false;
   checkIntervalMinutes = 60;
+  maxConcurrentDownloads: number | null = null;
   titleRegex = '';
   skipSubscriberOnly = false;
   editingTitleRegexId: string | null = null;
@@ -302,6 +303,11 @@ export class App implements AfterViewInit, OnInit, OnDestroy {
     if (!Number.isNaN(ci) && ci >= 1) {
       this.checkIntervalMinutes = ci;
     }
+
+    const mc = parseInt(this.cookieService.get('metube_max_concurrent') || '', 10);
+    if (!Number.isNaN(mc) && mc >= 1) {
+      this.maxConcurrentDownloads = mc;
+    }
     this.activeTheme = this.getPreferredTheme(this.cookieService);
 
     // Subscribe to download updates
@@ -463,6 +469,12 @@ export class App implements AfterViewInit, OnInit, OnDestroy {
             this.checkIntervalMinutes = dci;
           }
         }
+        if (!this.cookieService.check('metube_max_concurrent')) {
+          const mc = parseInt(String(config['MAX_CONCURRENT_DOWNLOADS'] ?? '3'), 10);
+          if (!Number.isNaN(mc) && mc >= 1) {
+            this.maxConcurrentDownloads = mc;
+          }
+        }
         this.cdr.markForCheck();
       }
     });
@@ -538,6 +550,14 @@ export class App implements AfterViewInit, OnInit, OnDestroy {
     this.cookieService.set('metube_check_interval', String(this.checkIntervalMinutes), {
       expires: this.settingsCookieExpiryDays,
     });
+  }
+
+  maxConcurrentDownloadsChanged() {
+    const v = this.maxConcurrentDownloads ?? 3;
+    this.cookieService.set('metube_max_concurrent', String(v), {
+      expires: this.settingsCookieExpiryDays,
+    });
+    this.downloads.setMaxConcurrent(v).subscribe();
   }
 
   private getStatusError(res: unknown): string | null {
